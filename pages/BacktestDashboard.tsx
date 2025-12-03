@@ -18,6 +18,7 @@ export const BacktestDashboard = () => {
   const [aiAnalysis, setAiAnalysis] = useState<string>('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
+  const [dataWarning, setDataWarning] = useState('');
 
   useEffect(() => {
     const s = StorageService.getStrategies();
@@ -33,6 +34,7 @@ export const BacktestDashboard = () => {
     setIsRunning(true);
     setResult(null);
     setErrorMessage('');
+    setDataWarning('');
     setAiAnalysis('');
     
     try {
@@ -54,7 +56,6 @@ export const BacktestDashboard = () => {
         const missingData: string[] = [];
         let datesSet = new Set<string>();
 
-        // We use this to track if we actually found data
         console.log(`Loading data for: ${allTickers.join(', ')} from IndexedDB...`);
 
         for(const t of allTickers) {
@@ -89,13 +90,18 @@ export const BacktestDashboard = () => {
         
         // Find start index
         const startDateIndex = sortedDates.findIndex(d => d >= cutoffDate);
-        if(startDateIndex === -1 && strategy.backtestDuration !== 'Max') {
-             // If we can't find a date AFTER cutoff, it means all data is OLDER? Or no data.
-             // We fallback to 0 if we have data.
-             console.warn("Could not find exact start date matching duration, using earliest available.");
-        }
         
-        // If Max, start at 0. If not found, start at 0. Else start at index.
+        // Check for Data Sufficiency
+        if (startDateIndex === -1 && strategy.backtestDuration !== 'Max') {
+            // This means all our data is "newer" than the cutoff? Or "older"?
+            // If data starts in 2023, and cutoff is 2020, index will be 0.
+            // If we have data from 2024 only, cutoff 2020. Index is 0.
+            // We need to check if sortedDates[0] is significantly AFTER cutoffDate
+            if (sortedDates.length > 0 && sortedDates[0] > cutoffDate) {
+                 setDataWarning(`Warning: Stored market data starts on ${sortedDates[0]}, but strategy requested data from ${cutoffDate}. The backtest period will be shorter than requested. Please go to Market Data Manager and Reload to fetch full 5Y history.`);
+            }
+        }
+
         const actualStartIndex = (strategy.backtestDuration === 'Max' || startDateIndex === -1) ? 0 : startDateIndex;
         
         const simulationDates = sortedDates.slice(actualStartIndex);
@@ -132,8 +138,11 @@ export const BacktestDashboard = () => {
             lastKnownPrices[t] = price || 1; // Default to 1 to prevent division by zero
         });
 
-        // Benchmark Start Price (Buy and Hold Baseline)
+        // Benchmark Sync: 
+        // We find the price of the benchmark on the exact start date of simulation.
+        // We also normalize the benchmark NAV to equal Initial Capital on that day.
         let benchmarkStartPrice = 0;
+        // Find the first valid price for benchmark in the simulation window
         for(const d of simulationDates) {
              const p = marketDataMap[benchmarkTicker].get(d);
              if(p) { benchmarkStartPrice = p.close; break; }
@@ -195,7 +204,6 @@ export const BacktestDashboard = () => {
                         basketReturnOn += r * item.weight;
                         lastKnownPrices[item.ticker] = currP; // Update known
                     }
-                    // If currP missing, return is 0 (price holds), lastKnown stays same
                 });
 
                 // Risk Off Basket Return
@@ -219,15 +227,16 @@ export const BacktestDashboard = () => {
             }
 
             // --- B. Benchmark Value Update (Buy and Hold) ---
-            // Find current price for benchmark, or fallback to last known to avoid drops
+            // Formula: (Current Price / Start Price) * Initial Capital
+            // We use strict Buy & Hold logic normalized to Initial Capital at start of sim.
             let currentBmPrice = getExecutionPrice(benchmarkTicker, date);
             if (!currentBmPrice) {
+                // Gap fill
                 currentBmPrice = lastKnownPrices[benchmarkTicker] || benchmarkStartPrice;
             } else {
                 lastKnownPrices[benchmarkTicker] = currentBmPrice;
             }
             
-            // Formula: (Current Price / Start Price) * Initial Capital
             const benchmarkNAV = (currentBmPrice / benchmarkStartPrice) * strategy.initialCapital;
 
 
@@ -263,12 +272,6 @@ export const BacktestDashboard = () => {
                     targetRiskOnWeight = 1.0;
                 }
 
-                // Apply Rebalancing Frequency Logic
-                // For daily, update every day. For weekly/monthly, check date.
-                // Simplified: We assume daily rebalance for signals in this demo unless specifically implemented
-                // To implement strict frequency:
-                // if (isRebalanceDate(date, strategy.rebalanceFreq)) { ... }
-                // For now, updating daily ensures the chart looks reactive as per rule.
                 currentAllocations.riskOn = targetRiskOnWeight;
                 currentAllocations.riskOff = 1.0 - targetRiskOnWeight;
             }
@@ -366,6 +369,12 @@ export const BacktestDashboard = () => {
        {errorMessage && (
            <div className="p-4 bg-red-900/20 border border-red-500/50 rounded-lg text-red-200">
                Error: {errorMessage}
+           </div>
+       )}
+
+       {dataWarning && (
+           <div className="p-4 bg-yellow-900/20 border border-yellow-500/50 rounded-lg text-yellow-200">
+               {dataWarning}
            </div>
        )}
 

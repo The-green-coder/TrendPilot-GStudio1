@@ -68,17 +68,26 @@ export const MarketDataManager = () => {
             for (let i = 0; i < total; i++) {
                 const sym = validSymbols[i];
                 
-                // 1. Check if data already exists (Resume logic)
-                const exists = await StorageService.hasMarketData(sym.ticker);
-                if (exists) {
-                    setStatusMessage(`Skipping ${sym.ticker} (Already downloaded)...`);
+                // Smart Resume Logic:
+                // Check if data exists AND if it covers at least 4.5 years (approx 1600 days).
+                // If the user requests a 5Y backtest but only has 1Y data, we must re-download.
+                let shouldDownload = true;
+                const existingData = await StorageService.getMarketData(sym.ticker);
+                
+                if (existingData && existingData.length > 1600) {
+                    // We have sufficient history (> 4.5 years), so we can skip
+                    shouldDownload = false;
+                }
+
+                if (!shouldDownload) {
+                    setStatusMessage(`Skipping ${sym.ticker} (Sufficient data exists)...`);
                     skippedCount++;
-                    successCount++; // Count as success for progress purposes
+                    successCount++; 
                     setProgress(Math.round(((i + 1) / total) * 100));
                     continue;
                 }
 
-                // 2. Fetch if missing
+                // 2. Fetch if missing or insufficient
                 setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total}) via ${provider}...`);
                 
                 try {
@@ -114,7 +123,7 @@ export const MarketDataManager = () => {
                 }
             }
 
-            setStatusMessage(`Completed. New: ${successCount - skippedCount}, Skipped: ${skippedCount}, Failed: ${failCount}`);
+            setStatusMessage(`Completed. Updated: ${successCount - skippedCount}, Skipped (Sufficient): ${skippedCount}, Failed: ${failCount}`);
             await checkDataStatus(symbols);
         } else {
              await sleep(1000);
@@ -172,8 +181,7 @@ export const MarketDataManager = () => {
                 <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-4">
                     <h3 className="text-lg font-medium text-slate-200">Data Operations</h3>
                     <div className="text-sm text-yellow-500/80 bg-yellow-500/10 p-2 rounded">
-                        Note: "Reload" will fetch <strong>missing</strong> data. Existing data is preserved in the database.
-                        Use "Clear Data" to delete everything and start fresh.
+                        Note: "Reload" will fetch data if it is missing OR if existing data is older/shorter than 5 years.
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <Button 
@@ -181,7 +189,7 @@ export const MarketDataManager = () => {
                             onClick={() => handleDownload('RELOAD')}
                             disabled={isDownloading}
                         >
-                           Reload (Fill Missing)
+                           Reload (Ensure 5Y History)
                         </Button>
                          <Button 
                             variant="danger" 

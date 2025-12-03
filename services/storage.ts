@@ -11,7 +11,7 @@ const KEYS = {
 
 // IndexedDB Configuration (Async, for large Market Data)
 const DB_NAME = 'TrendPilotDB';
-const DB_VERSION = 1;
+const DB_VERSION = 2; // Bumped version to ensure schema refresh
 const STORE_NAME = 'market_data';
 
 // --- IndexedDB Helpers ---
