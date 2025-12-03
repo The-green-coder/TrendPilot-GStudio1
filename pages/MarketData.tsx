@@ -101,10 +101,10 @@ export const MarketDataManager = () => {
 
                 setProgress(Math.round(((i + 1) / total) * 100));
                 
-                // Polite Delay: Wait 2 seconds between requests
+                // Polite Delay: Wait 2.5 seconds between requests
                 if (i < total - 1) {
                     setStatusMessage(`Waiting (Rate Limit Prevention)...`);
-                    await sleep(2000);
+                    await sleep(2500);
                 }
             }
 
