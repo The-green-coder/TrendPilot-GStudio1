@@ -5,7 +5,6 @@ export interface MarketDataCache {
   [ticker: string]: MarketDataPoint[];
 }
 
-// Host rotation
 const YAHOO_HOSTS = [
     'https://query1.finance.yahoo.com/v8/finance/chart/',
     'https://query2.finance.yahoo.com/v8/finance/chart/'
@@ -16,45 +15,49 @@ interface ProxyDef {
     buildUrl: (target: string) => string;
 }
 
-// Robust Proxy List
-// CodeTabs is often the most reliable for JSON, followed by AllOrigins.
+// Curated list of proxies that handle "Simple Requests" well (No Preflight/CORS issues)
 const PROXIES: ProxyDef[] = [
     {
         name: 'allorigins',
         buildUrl: (target: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`
     },
     {
-        name: 'codetabs',
-        buildUrl: (target: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`
-    },
-    {
-        name: 'corsproxy',
-        buildUrl: (target: string) => `https://corsproxy.io/?${encodeURIComponent(target)}`
+        name: 'thingproxy',
+        buildUrl: (target: string) => `https://thingproxy.freeboard.io/fetch/${target}`
     }
 ];
+
+// Keep track of which proxy is currently working to speed up subsequent requests
+let activeProxyIndex = 0;
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 export const MarketDataService = {
   
   async fetchHistory(ticker: string, range: string = '5y', interval: string = '1d'): Promise<MarketDataPoint[]> {
-    let lastError: any;
     const cleanTicker = ticker.trim().toUpperCase();
-    
-    // Iterate through proxies
-    for (const proxy of PROXIES) {
-        // Iterate through Yahoo Hosts
+    let lastError: any;
+
+    // Try proxies starting from the last known good one (activeProxyIndex)
+    // We loop through the list once.
+    for (let i = 0; i < PROXIES.length; i++) {
+        const proxyIndex = (activeProxyIndex + i) % PROXIES.length;
+        const proxy = PROXIES[proxyIndex];
+        
+        // Try Yahoo Hosts
         for (const host of YAHOO_HOSTS) {
             try {
-                // Construct target URL
-                const targetUrl = `${host}${cleanTicker}?interval=${interval}&range=${range}`;
+                // Add random timestamp to prevent caching of error pages by the proxy
+                const cacheBuster = `&_=${Date.now()}`;
+                const targetUrl = `${host}${cleanTicker}?interval=${interval}&range=${range}${cacheBuster}`;
                 const fetchUrl = proxy.buildUrl(targetUrl);
 
-                // console.log(`[MarketData] Fetching via ${proxy.name}:`, fetchUrl);
+                // console.log(`[MarketData] Fetching ${cleanTicker} via ${proxy.name}...`);
 
                 const response = await fetch(fetchUrl, {
                     method: 'GET',
-                    credentials: 'omit', // Prevent cookies
+                    credentials: 'omit', // Critical: treats as Simple Request, skips CORS Preflight
+                    // No custom headers allowed for Simple Request
                 });
                 
                 if (!response.ok) {
@@ -63,16 +66,15 @@ export const MarketDataService = {
                 
                 const text = await response.text();
                 
-                // Validate response is not an error page disguised as 200 OK
+                // Strict validation
                 if (!text || text.length < 10) throw new Error("Empty response");
-                if (text.startsWith('<')) throw new Error("Received HTML instead of JSON");
-                if (text.includes("Will be right back")) throw new Error("Yahoo Rate Limit");
-
+                if (text.trim().startsWith('<')) throw new Error("Received HTML error page");
+                
                 let json;
                 try {
                     json = JSON.parse(text);
                 } catch (e) {
-                    throw new Error("Invalid JSON");
+                    throw new Error("Invalid JSON structure");
                 }
                 
                 if (json.chart?.error) {
@@ -80,54 +82,55 @@ export const MarketDataService = {
                 }
 
                 const result = json.chart?.result?.[0];
-                if (!result) throw new Error('No result in JSON');
+                if (!result) throw new Error('No result object in JSON');
 
                 const timestamps = result.timestamp;
                 const quote = result.indicators.quote[0];
                 
                 if (!timestamps || !quote) {
-                    // Symbol might exist but has no data for this range
-                    return []; 
+                    return []; // Valid symbol, just no data
                 }
 
+                const data: MarketDataPoint[] = [];
                 const closes = quote.close;
                 const opens = quote.open;
                 const highs = quote.high;
                 const lows = quote.low;
                 const volumes = quote.volume;
 
-                const data: MarketDataPoint[] = [];
-                for (let i = 0; i < timestamps.length; i++) {
-                    // Filter out nulls (common in Yahoo data)
-                    if (timestamps[i] && closes[i] !== null && closes[i] !== undefined) {
-                        const date = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
+                for (let j = 0; j < timestamps.length; j++) {
+                    // Yahoo often returns nulls for some intervals
+                    if (timestamps[j] && closes[j] !== null && closes[j] !== undefined) {
                         data.push({
-                            date,
-                            open: Number((opens[i] || closes[i]).toFixed(2)),
-                            high: Number((highs[i] || closes[i]).toFixed(2)),
-                            low: Number((lows[i] || closes[i]).toFixed(2)),
-                            close: Number(closes[i].toFixed(2)),
-                            volume: volumes[i] || 0
+                            date: new Date(timestamps[j] * 1000).toISOString().split('T')[0],
+                            open: Number((opens[j] || closes[j]).toFixed(2)),
+                            high: Number((highs[j] || closes[j]).toFixed(2)),
+                            low: Number((lows[j] || closes[j]).toFixed(2)),
+                            close: Number(closes[j].toFixed(2)),
+                            volume: volumes[j] || 0
                         });
                     }
                 }
 
-                if (data.length === 0) throw new Error("Parsed data empty");
+                if (data.length === 0) throw new Error("Parsed data is empty");
                 
-                // Success! Return immediately.
+                // Success! Update the active proxy index so future requests use this reliable one first.
+                activeProxyIndex = proxyIndex;
+                
                 return data;
 
             } catch (error: any) {
-                // Log and continue to next fallback
-                // console.warn(`Failed via ${proxy.name} (${host}): ${error.message}`);
+                // console.warn(`Failed ${cleanTicker} via ${proxy.name}: ${error.message}`);
                 lastError = error;
-                await sleep(500); // Wait a bit before hitting next proxy to be polite
+                // Don't sleep here; fast fail to next proxy/host
             }
         }
+        // Small delay before switching proxies entirely to avoid burst-limit on the next proxy
+        await sleep(200);
     }
 
-    console.error(`All attempts failed for ${cleanTicker}. Last error:`, lastError);
-    throw lastError || new Error("Unknown error");
+    console.error(`All proxies failed for ${cleanTicker}. Last error:`, lastError);
+    throw lastError || new Error("Network/Proxy Error");
   },
 
   calculateSMA(data: MarketDataPoint[], period: number, priceField: keyof MarketDataPoint = 'close'): { date: string; value: number }[] {
