@@ -2,11 +2,15 @@
 import { MarketDataPoint } from '../types';
 
 const YAHOO_BASE = 'https://query2.finance.yahoo.com/v8/finance/chart/';
+const EODHD_BASE = 'https://eodhd.com/api/eod/';
+const EODHD_DEFAULT_KEY = '68ff66761ac269.80544168';
 
 interface ProxyStrategy {
     name: string;
     fetch: (targetUrl: string) => Promise<string>;
 }
+
+// --- PROXY STRATEGIES FOR YAHOO ---
 
 // 1. CorsProxy.io (Fastest, Direct)
 const fetchCorsProxy = async (target: string): Promise<string> => {
@@ -43,42 +47,92 @@ const fetchCodeTabs = async (target: string): Promise<string> => {
 };
 
 const PROXIES: ProxyStrategy[] = [
+    { name: 'allorigins-json', fetch: fetchAllOriginsJSON }, // Most reliable first
     { name: 'corsproxy', fetch: fetchCorsProxy },
-    { name: 'allorigins-raw', fetch: fetchAllOriginsRaw },
-    { name: 'allorigins-json', fetch: fetchAllOriginsJSON },
     { name: 'codetabs', fetch: fetchCodeTabs },
+    { name: 'allorigins-raw', fetch: fetchAllOriginsRaw },
 ];
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+// --- EODHD FETCHER (Direct) ---
+const fetchEODHD = async (ticker: string, range: string, apiKey?: string): Promise<MarketDataPoint[]> => {
+    // EODHD requires Exchange suffix for most symbols. 
+    // We assume US default if no suffix provided.
+    // e.g. "SPY" -> "SPY.US", "INDY" -> "INDY.US"
+    let formattedTicker = ticker;
+    if (!ticker.includes('.') && !ticker.startsWith('^')) {
+        formattedTicker = `${ticker}.US`;
+    }
+    // Handle Nifty special case if using ^NSEI
+    if (ticker === '^NSEI') formattedTicker = 'NSEI.INDX';
+
+    // Calculate From Date
+    // We intentionally fetch MORE data than 'range' implies to handle Moving Average warmups.
+    // e.g. if 5y requested, we fetch 6y to be safe.
+    const now = new Date();
+    const past = new Date();
+    
+    // Set a generous buffer
+    if (range === '5y') past.setFullYear(now.getFullYear() - 6);
+    else if (range === '1y') past.setFullYear(now.getFullYear() - 2);
+    else if (range === 'max') past.setFullYear(1990); // Way back
+    else past.setFullYear(now.getFullYear() - 6); // Default 6 years
+    
+    const fromDate = past.toISOString().split('T')[0];
+    const keyToUse = apiKey && apiKey.trim().length > 0 ? apiKey : EODHD_DEFAULT_KEY;
+
+    const url = `${EODHD_BASE}${formattedTicker}?api_token=${keyToUse}&fmt=json&from=${fromDate}`;
+
+    try {
+        const res = await fetch(url);
+        if (!res.ok) {
+            // Check for common EODHD errors
+            if (res.status === 403) throw new Error("EODHD API Key Invalid or Limit Reached");
+            if (res.status === 404) throw new Error("Symbol not found on EODHD");
+            throw new Error(`EODHD HTTP ${res.status}`);
+        }
+        
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error("EODHD returned invalid format");
+
+        return data.map((d: any) => ({
+            date: d.date,
+            open: Number(d.open),
+            high: Number(d.high),
+            low: Number(d.low),
+            close: Number(d.close),
+            volume: Number(d.volume)
+        }));
+
+    } catch (e) {
+        console.error("EODHD Fetch Error:", e);
+        throw e;
+    }
+};
+
 export const MarketDataService = {
   
-  async fetchHistory(ticker: string, range: string = '5y', interval: string = '1d'): Promise<MarketDataPoint[]> {
-    // Strict cleaning
+  async fetchHistory(ticker: string, range: string = '5y', interval: string = '1d', provider: string = 'yfinance', apiKey?: string): Promise<MarketDataPoint[]> {
     const cleanTicker = ticker.trim().toUpperCase().replace(/[^A-Z0-9^.-]/g, '');
-    
-    // Yahoo URL (Minimal parameters to avoid blocking)
+
+    // 1. EODHD PATH
+    if (provider === 'eodhd') {
+        return await fetchEODHD(cleanTicker, range, apiKey);
+    }
+
+    // 2. YAHOO (PROXY) PATH
     const targetUrl = `${YAHOO_BASE}${cleanTicker}?interval=${interval}&range=${range}`;
-    
     let lastError: any;
 
-    // Try each proxy strategy in order
     for (const proxy of PROXIES) {
         try {
-            // Fetch via Proxy
             const responseText = await proxy.fetch(targetUrl);
 
-            // Validation 1: Empty
-            if (!responseText || responseText.length < 50) {
-                 throw new Error("Empty response");
-            }
-            
-            // Validation 2: HTML/Error Page
-            if (responseText.trim().toLowerCase().startsWith('<')) {
-                throw new Error("HTML/Error Page detected");
-            }
+            // Validation
+            if (!responseText || responseText.length < 50) throw new Error("Empty response");
+            if (responseText.trim().toLowerCase().startsWith('<')) throw new Error("HTML/Error Page detected");
 
-            // Parse Yahoo JSON
             let json;
             try {
                 json = JSON.parse(responseText);
@@ -86,7 +140,6 @@ export const MarketDataService = {
                 throw new Error("JSON Parse Failed");
             }
 
-            // Yahoo Logic Error Check
             if (json.chart?.error) {
                 const code = json.chart.error.code;
                 if (code === 'Not Found' || code === 'Not Found: No data found, symbol may be delisted') {
@@ -125,14 +178,12 @@ export const MarketDataService = {
             }
 
             if (data.length === 0) throw new Error("Parsed data is empty");
-            
-            // Success!
             return data;
 
         } catch (error: any) {
             console.warn(`Proxy ${proxy.name} failed for ${cleanTicker}: ${error.message}`);
             lastError = error;
-            await sleep(500); // Short cooldown before next proxy
+            await sleep(500); 
         }
     }
 

@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
-import { Card, Button, Select } from '../components/ui';
+import { Card, Button, Select, Input } from '../components/ui';
 import { StorageService } from '../services/storage';
 import { MarketDataService } from '../services/marketData';
 import { MARKET_DATA_PROVIDERS } from '../constants';
@@ -8,6 +8,7 @@ import { SymbolData } from '../types';
 
 export const MarketDataManager = () => {
   const [provider, setProvider] = useState(MARKET_DATA_PROVIDERS[0].id);
+  const [customApiKey, setCustomApiKey] = useState('');
   const [progress, setProgress] = useState(0);
   const [isDownloading, setIsDownloading] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
@@ -78,10 +79,13 @@ export const MarketDataManager = () => {
                 }
 
                 // 2. Fetch if missing
-                setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total})...`);
+                setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total}) via ${provider}...`);
                 
                 try {
-                    const data = await MarketDataService.fetchHistory(sym.ticker, '5y', '1d');
+                    // PASS PROVIDER ID AND CUSTOM KEY HERE
+                    // We fetch a bit more than 5y to ensure we have buffer for MAs
+                    const data = await MarketDataService.fetchHistory(sym.ticker, '5y', '1d', provider, customApiKey);
+                    
                     if (data && data.length > 0) {
                         setStatusMessage(`Saving ${sym.ticker} to database...`);
                         const saved = await StorageService.saveMarketData(sym.ticker, data);
@@ -101,10 +105,12 @@ export const MarketDataManager = () => {
 
                 setProgress(Math.round(((i + 1) / total) * 100));
                 
-                // Polite Delay: Wait 2.5 seconds between requests
+                // Polite Delay: Wait 2.5 seconds between requests (Only needed for Free/Proxy)
+                // If EODHD, we can go faster.
                 if (i < total - 1) {
-                    setStatusMessage(`Waiting (Rate Limit Prevention)...`);
-                    await sleep(2500);
+                    const delay = provider === 'eodhd' ? 200 : 2500;
+                    setStatusMessage(`Waiting...`);
+                    await sleep(delay);
                 }
             }
 
@@ -132,23 +138,41 @@ export const MarketDataManager = () => {
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <Card className="lg:col-span-2 space-y-6">
-                <div className="flex items-end gap-4">
-                    <Select
-                        label="Primary Data Provider"
-                        value={provider}
-                        onChange={(e) => setProvider(e.target.value)}
-                        options={MARKET_DATA_PROVIDERS.map(p => ({ value: p.id, label: p.name }))}
-                        className="flex-1"
-                    />
-                    <div className="text-sm text-slate-500 pb-3">
-                        Status: <span className="text-emerald-400">Connected</span>
+                <div className="space-y-4">
+                    <div className="flex items-end gap-4">
+                        <Select
+                            label="Primary Data Provider"
+                            value={provider}
+                            onChange={(e) => setProvider(e.target.value)}
+                            options={MARKET_DATA_PROVIDERS.map(p => ({ value: p.id, label: p.name }))}
+                            className="flex-1"
+                        />
+                        <div className="text-sm text-slate-500 pb-3">
+                            Status: <span className="text-emerald-400">Connected</span>
+                        </div>
                     </div>
+                    
+                    {/* EODHD Specific Input */}
+                    {provider === 'eodhd' && (
+                        <div className="animate-in fade-in slide-in-from-top-2 duration-300">
+                            <Input 
+                                label="EODHD Connection Key"
+                                placeholder="Paste your API Token here (Leave empty to use default)"
+                                value={customApiKey}
+                                onChange={(e) => setCustomApiKey(e.target.value)}
+                                className="font-mono text-sm"
+                            />
+                            <p className="text-xs text-slate-500 mt-1">
+                                Default: 68ff66761ac269.80544168
+                            </p>
+                        </div>
+                    )}
                 </div>
 
                 <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-4">
                     <h3 className="text-lg font-medium text-slate-200">Data Operations</h3>
                     <div className="text-sm text-yellow-500/80 bg-yellow-500/10 p-2 rounded">
-                        Note: "Reload" will fetch <strong>missing</strong> data. Existing data is preserved.
+                        Note: "Reload" will fetch <strong>missing</strong> data. Existing data is preserved in the database.
                         Use "Clear Data" to delete everything and start fresh.
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -219,7 +243,7 @@ export const MarketDataManager = () => {
                     {symbols.length === 0 && <div className="text-sm text-slate-500">No symbols found</div>}
                 </div>
                 <div className="mt-4 pt-2 border-t border-slate-800 text-xs text-slate-500">
-                    Source: Yahoo Finance (via Proxy)
+                    Source: {provider === 'eodhd' ? 'EODHD API' : 'Yahoo Finance (via Proxy)'}
                 </div>
             </Card>
         </div>

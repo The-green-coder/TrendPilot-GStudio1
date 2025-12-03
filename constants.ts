@@ -50,6 +50,7 @@ export const INITIAL_STRATEGIES: Strategy[] = [
 
 export const MARKET_DATA_PROVIDERS: MarketDataProvider[] = [
   { id: 'yfinance', name: 'yFinance (Free EOD)', type: 'Free' },
+  { id: 'eodhd', name: 'EODHD (Official)', type: 'Paid' },
   { id: 'alphavantage', name: 'Alpha Vantage', type: 'Paid' },
   { id: 'quandl', name: 'Quandl', type: 'Paid' }
 ];

@@ -77,13 +77,17 @@ export const BacktestDashboard = () => {
         const durationMap: Record<string, number> = { '3M': 90, '6M': 180, '1Y': 365, '3Y': 1095, '5Y': 1825, 'Max': 99999 };
         const durationDays = durationMap[strategy.backtestDuration] || 1825; 
         
-        const now = new Date();
-        const cutoffDate = new Date(now.setDate(now.getDate() - durationDays)).toISOString().split('T')[0];
+        // FIX: Create a NEW Date object for cutoff to avoid mutating 'now'
+        const cutoffDateObj = new Date();
+        cutoffDateObj.setDate(cutoffDateObj.getDate() - durationDays);
+        const cutoffDate = cutoffDateObj.toISOString().split('T')[0];
         
         const startDateIndex = sortedDates.findIndex(d => d >= cutoffDate);
-        if(startDateIndex === -1) throw new Error("No data in the selected date range.");
+        if(startDateIndex === -1) throw new Error("No data in the selected date range. Ensure Market Data covers the backtest period.");
 
         const simulationDates = sortedDates.slice(startDateIndex);
+        if (simulationDates.length === 0) throw new Error("Not enough data points for simulation.");
+
         const benchmarkStartPrice = marketDataMap[benchmarkTicker].get(simulationDates[0])?.close || 1;
 
         // 4. Helper: Get Price based on Preference (Open, Close, Average) for TRADE EXECUTION
@@ -105,6 +109,8 @@ export const BacktestDashboard = () => {
         const primaryRiskOnTicker = riskOnTickers[0];
         
         // Build Close Price History for MA Calculation
+        // Note: We use ALL available data (sortedDates) for MA calculation, 
+        // not just the simulation window, to ensure MAs are valid at start of sim.
         const primaryFullHistory = sortedDates.map(d => {
             const point = marketDataMap[primaryRiskOnTicker].get(d);
             return {
