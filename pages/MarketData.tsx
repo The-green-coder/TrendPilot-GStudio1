@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { Card, Button, Select } from '../components/ui';
 import { StorageService } from '../services/storage';
@@ -29,6 +30,8 @@ export const MarketDataManager = () => {
       setDataStatus(status);
       setLoadingStatus(false);
   };
+
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
   const handleDownload = async (type: 'RELOAD' | 'INTRADAY' | 'NAV') => {
     setIsDownloading(true);
@@ -66,13 +69,16 @@ export const MarketDataManager = () => {
                     console.error(`Failed to fetch ${sym.ticker}`, err);
                 }
                 
+                // Add a small delay between symbols to avoid overwhelming the proxy
+                await sleep(1000);
+
                 current++;
                 setProgress(Math.round((current / total) * 100));
             }
             setStatusMessage(`Completed. Success: ${successCount}, Failed: ${failCount}`);
             await checkDataStatus(symbols);
         } else {
-             await new Promise(r => setTimeout(r, 1000));
+             await sleep(1000);
              setProgress(100);
              setStatusMessage('Update Completed.');
         }

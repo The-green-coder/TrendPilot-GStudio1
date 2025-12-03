@@ -7,30 +7,33 @@ export interface MarketDataCache {
 
 // Host rotation
 const YAHOO_HOSTS = [
-    'https://query2.finance.yahoo.com/v8/finance/chart/',
-    'https://query1.finance.yahoo.com/v8/finance/chart/'
+    'https://query1.finance.yahoo.com/v8/finance/chart/',
+    'https://query2.finance.yahoo.com/v8/finance/chart/'
 ];
 
-// Proxy rotation strategies
-// We use multiple proxies because Yahoo Finance rate limits or blocks them frequently.
-const PROXIES = [
+interface ProxyDef {
+    name: string;
+    buildUrl: (target: string) => string;
+}
+
+// Robust Proxy List
+// CodeTabs is often the most reliable for JSON, followed by AllOrigins.
+const PROXIES: ProxyDef[] = [
+    {
+        name: 'allorigins',
+        buildUrl: (target: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`
+    },
     {
         name: 'codetabs',
-        url: (target: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`
+        buildUrl: (target: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`
     },
     {
         name: 'corsproxy',
-        url: (target: string) => `https://corsproxy.io/?${encodeURIComponent(target)}`
-    },
-    {
-        name: 'allorigins',
-        url: (target: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`
-    },
-    {
-        name: 'thingproxy',
-        url: (target: string) => `https://thingproxy.freeboard.io/fetch/${target}`
+        buildUrl: (target: string) => `https://corsproxy.io/?${encodeURIComponent(target)}`
     }
 ];
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 export const MarketDataService = {
   
@@ -38,73 +41,64 @@ export const MarketDataService = {
     let lastError: any;
     const cleanTicker = ticker.trim().toUpperCase();
     
-    // Add cache buster to prevent sticky 403s/CORS errors from proxies
-    const cacheBuster = `&_cb=${Date.now()}`;
-
-    // Try every combination of Proxy and Host until success
+    // Iterate through proxies
     for (const proxy of PROXIES) {
+        // Iterate through Yahoo Hosts
         for (const host of YAHOO_HOSTS) {
             try {
-                // Yahoo API parameters
-                // includeAdjustedClose=true is standard, sometimes helps with data consistency
-                const targetUrl = `${host}${cleanTicker}?interval=${interval}&range=${range}&events=history&includeAdjustedClose=true${cacheBuster}`;
-                const fetchUrl = proxy.url(targetUrl);
-                
-                // console.log(`Attempting fetch via ${proxy.name}:`, fetchUrl);
+                // Construct target URL
+                const targetUrl = `${host}${cleanTicker}?interval=${interval}&range=${range}`;
+                const fetchUrl = proxy.buildUrl(targetUrl);
+
+                // console.log(`[MarketData] Fetching via ${proxy.name}:`, fetchUrl);
 
                 const response = await fetch(fetchUrl, {
-                    cache: 'no-store', // Prevent caching of failed CORS responses
-                    headers: {
-                        'Accept': 'application/json'
-                    }
+                    method: 'GET',
+                    credentials: 'omit', // Prevent cookies
                 });
                 
-                if (response.status === 403 || response.status === 401) {
-                    throw new Error(`Blocked (${response.status}) by provider via ${proxy.name}`);
-                }
-
                 if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status} via ${proxy.name}`);
+                    throw new Error(`HTTP ${response.status}`);
                 }
                 
-                // Robust parsing: Get text first, validate it looks like JSON
                 const text = await response.text();
-                if (!text || text.trim().length === 0) throw new Error("Empty response");
                 
-                // Common proxy error pages or Yahoo blocks
-                if (text.includes("Will be right back") || text.includes("Oath") || text.includes("999 Unable to process")) {
-                     throw new Error("Yahoo Rate Limit/Block detected");
-                }
-                
+                // Validate response is not an error page disguised as 200 OK
+                if (!text || text.length < 10) throw new Error("Empty response");
+                if (text.startsWith('<')) throw new Error("Received HTML instead of JSON");
+                if (text.includes("Will be right back")) throw new Error("Yahoo Rate Limit");
+
                 let json;
                 try {
                     json = JSON.parse(text);
                 } catch (e) {
-                    // console.warn("JSON Parse failed", text.substring(0, 100));
-                    throw new Error(`JSON Parse Error: ${e instanceof Error ? e.message : String(e)}`);
+                    throw new Error("Invalid JSON");
                 }
                 
                 if (json.chart?.error) {
-                    throw new Error(JSON.stringify(json.chart.error));
+                    throw new Error(`API Error: ${JSON.stringify(json.chart.error)}`);
                 }
 
                 const result = json.chart?.result?.[0];
-                if (!result) throw new Error('No data found in response structure');
+                if (!result) throw new Error('No result in JSON');
 
                 const timestamps = result.timestamp;
                 const quote = result.indicators.quote[0];
                 
-                if (!timestamps || !quote) return [];
+                if (!timestamps || !quote) {
+                    // Symbol might exist but has no data for this range
+                    return []; 
+                }
 
+                const closes = quote.close;
                 const opens = quote.open;
                 const highs = quote.high;
                 const lows = quote.low;
-                const closes = quote.close;
                 const volumes = quote.volume;
 
                 const data: MarketDataPoint[] = [];
                 for (let i = 0; i < timestamps.length; i++) {
-                    // Filter out nulls
+                    // Filter out nulls (common in Yahoo data)
                     if (timestamps[i] && closes[i] !== null && closes[i] !== undefined) {
                         const date = new Date(timestamps[i] * 1000).toISOString().split('T')[0];
                         data.push({
@@ -117,30 +111,25 @@ export const MarketDataService = {
                         });
                     }
                 }
-                
-                if (data.length === 0) throw new Error("Parsed data is empty");
 
-                // If success, return immediately
+                if (data.length === 0) throw new Error("Parsed data empty");
+                
+                // Success! Return immediately.
                 return data;
 
-            } catch (error) {
+            } catch (error: any) {
+                // Log and continue to next fallback
+                // console.warn(`Failed via ${proxy.name} (${host}): ${error.message}`);
                 lastError = error;
-                // Continue loop to next proxy/host
-                // console.warn(`Failed via ${proxy.name} on ${host}:`, error);
+                await sleep(500); // Wait a bit before hitting next proxy to be polite
             }
         }
     }
 
-    console.error(`All fetch attempts failed for ${cleanTicker}. Last error:`, lastError);
-    throw lastError;
+    console.error(`All attempts failed for ${cleanTicker}. Last error:`, lastError);
+    throw lastError || new Error("Unknown error");
   },
 
-  /**
-   * Calculates Simple Moving Average
-   * @param data Array of MarketDataPoints
-   * @param period Period for SMA
-   * @param priceField Optional field to use (default: close)
-   */
   calculateSMA(data: MarketDataPoint[], period: number, priceField: keyof MarketDataPoint = 'close'): { date: string; value: number }[] {
     const sma: { date: string; value: number }[] = [];
     for (let i = 0; i < data.length; i++) {
