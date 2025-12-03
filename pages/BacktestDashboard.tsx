@@ -242,39 +242,33 @@ export const BacktestDashboard = () => {
             }
         };
 
-        // Determine Direction Multiplier
-        const getDirMult = (dir: 'Long' | 'Short') => dir === 'Short' ? -1 : 1;
-
         for(let i = 0; i < simulationDates.length; i++) {
             const date = simulationDates[i];
             
             // --- A. Calculate Current Portfolio Value ---
-            // If i=0, we have cash. If i>0, we calculate based on holdings value.
             let currentPortfolioValue = cash;
+            const currentExecutionPrices: Record<string, number> = {};
             
-            // Calculate value of current holdings
-            Object.keys(portfolioHoldings).forEach(ticker => {
+            // Update Prices and Calculate Value
+            allTickers.forEach(ticker => {
                 const price = getExecutionPrice(ticker, date);
                 if (price) {
-                    const shares = portfolioHoldings[ticker];
-                    currentPortfolioValue += shares * price;
+                    currentExecutionPrices[ticker] = price;
+                    lastKnownPrices[ticker] = price;
+                } else {
+                    currentExecutionPrices[ticker] = lastKnownPrices[ticker];
                 }
-                // If price missing, we assume last value (no change) or explicit logic
-                // For simplified backtest, we skip update if price missing but keep value same as prev?
-                // Better: Use lastKnownPrices
-                else {
-                    const lastP = lastKnownPrices[ticker];
-                    currentPortfolioValue += portfolioHoldings[ticker] * lastP;
+                
+                if (portfolioHoldings[ticker]) {
+                    currentPortfolioValue += portfolioHoldings[ticker] * currentExecutionPrices[ticker];
                 }
             });
             
-            // Update NAV tracking
             nav = currentPortfolioValue;
 
             // --- B. Benchmark Value Update ---
             let currentBmPrice = getExecutionPrice(benchmarkTicker, date);
             if (!currentBmPrice) currentBmPrice = lastKnownPrices[benchmarkTicker] || benchmarkStartPrice;
-            lastKnownPrices[benchmarkTicker] = currentBmPrice;
             const benchmarkNAV = (currentBmPrice / benchmarkStartPrice) * strategy.initialCapital;
 
             // --- C. Signal Generation ---
@@ -305,89 +299,108 @@ export const BacktestDashboard = () => {
                         targetRiskOnWeight = w;
                     }
                 } else {
-                    targetRiskOnWeight = 1.0;
+                    // Fallback or hold previous
+                    // targetRiskOnWeight = 1.0; 
+                    // Better to hold previous if MA data missing
                 }
             }
             
             currentAllocations.riskOn = targetRiskOnWeight;
             currentAllocations.riskOff = 1.0 - targetRiskOnWeight;
 
-            // --- D. Rebalancing Execution ---
+            // --- D. Delta Rebalancing Execution ---
             if (isRebalanceDay(date, i, strategy.rebalanceFreq)) {
                 
-                // 1. Sell Everything first (conceptually) to get Cash
-                // In a real system we would net-off, but for simulation simple sell-all buy-new works
-                let tempCash = cash;
+                // 1. Calculate Target Dollar Amounts for every Asset
+                const targetValues: Record<string, number> = {};
                 
-                // Sell existing
-                Object.keys(portfolioHoldings).forEach(ticker => {
-                    const qty = portfolioHoldings[ticker];
-                    if (qty !== 0) {
-                        const price = getExecutionPrice(ticker, date) || lastKnownPrices[ticker];
-                        const val = qty * price;
-                        const txCost = val * (strategy.transactionCostPct / 100);
-                        tempCash += val - txCost;
-
-                        if (saveTransactions) {
-                            recordedTransactions.push({
-                                date, ticker, action: 'SELL', price, quantity: qty, totalValue: val, cost: txCost
-                            });
-                        }
-                    }
-                });
-                
-                portfolioHoldings = {}; // Reset holdings
-                
-                // 2. Buy New Allocations
-                const riskOnAmt = tempCash * currentAllocations.riskOn;
-                const riskOffAmt = tempCash * currentAllocations.riskOff;
-
-                // Execute Risk On Buys
+                // Risk On Targets
                 strategy.riskOnComponents.forEach(comp => {
                     const ticker = getTicker(comp.symbolId).trim();
-                    const weight = (comp.allocation / totalOnAlloc); // Normalized within basket
-                    const amountToBuy = riskOnAmt * weight;
-                    
-                    if (amountToBuy > 0) {
-                        const price = getExecutionPrice(ticker, date) || lastKnownPrices[ticker];
-                        const txCost = amountToBuy * (strategy.transactionCostPct / 100);
-                        const netAmount = amountToBuy - txCost;
-                        const qty = netAmount / price;
-                        
-                        // Add to holdings
-                        portfolioHoldings[ticker] = (portfolioHoldings[ticker] || 0) + qty;
-                        
-                        if (saveTransactions) {
-                            recordedTransactions.push({
-                                date, ticker, action: 'BUY', price, quantity: qty, totalValue: amountToBuy, cost: txCost
-                            });
-                        }
-                    }
+                    const basketWeight = (comp.allocation / totalOnAlloc); // e.g. 50% of Risk On part
+                    const finalWeight = currentAllocations.riskOn * basketWeight;
+                    targetValues[ticker] = nav * finalWeight;
                 });
 
-                // Execute Risk Off Buys
+                // Risk Off Targets
                 strategy.riskOffComponents.forEach(comp => {
                     const ticker = getTicker(comp.symbolId).trim();
-                    const weight = (comp.allocation / totalOffAlloc);
-                    const amountToBuy = riskOffAmt * weight;
+                    const basketWeight = (comp.allocation / totalOffAlloc);
+                    const finalWeight = currentAllocations.riskOff * basketWeight;
+                    targetValues[ticker] = nav * finalWeight;
+                });
+
+                // 2. Identify Deltas (Target - Current)
+                const involvedTickers = new Set([...Object.keys(portfolioHoldings), ...Object.keys(targetValues)]);
+                
+                // Phase 1: SELLS (Generate Cash)
+                involvedTickers.forEach(ticker => {
+                    const price = currentExecutionPrices[ticker];
+                    const currentShares = portfolioHoldings[ticker] || 0;
+                    const currentValue = currentShares * price;
+                    const targetValue = targetValues[ticker] || 0;
                     
-                    if (amountToBuy > 0) {
-                        const price = getExecutionPrice(ticker, date) || lastKnownPrices[ticker];
-                        const txCost = amountToBuy * (strategy.transactionCostPct / 100);
-                        const netAmount = amountToBuy - txCost;
-                        const qty = netAmount / price;
+                    const diff = targetValue - currentValue;
+
+                    // If Diff is negative (Overweight), SELL
+                    // Use a threshold (e.g. $1) to avoid tiny trades
+                    if (diff < -1 && price > 0) {
+                        const valToSell = Math.abs(diff);
+                        const qtyToSell = valToSell / price;
+                        const txCost = valToSell * (strategy.transactionCostPct / 100);
                         
-                        portfolioHoldings[ticker] = (portfolioHoldings[ticker] || 0) + qty;
+                        // Execute Sell
+                        portfolioHoldings[ticker] = currentShares - qtyToSell;
+                        if (portfolioHoldings[ticker] < 0.0001) delete portfolioHoldings[ticker];
                         
-                         if (saveTransactions) {
+                        const netCash = valToSell - txCost;
+                        cash += netCash;
+                        nav -= txCost; // NAV reduced by transaction cost
+
+                        if (saveTransactions) {
                             recordedTransactions.push({
-                                date, ticker, action: 'BUY', price, quantity: qty, totalValue: amountToBuy, cost: txCost
+                                date, ticker, action: 'SELL', price, quantity: qtyToSell, totalValue: valToSell, cost: txCost
                             });
                         }
                     }
                 });
 
-                cash = 0; // All deployed (or remainder is negligible/ignored for simplicity)
+                // Phase 2: BUYS (Deploy Cash)
+                involvedTickers.forEach(ticker => {
+                    const price = currentExecutionPrices[ticker];
+                    const currentShares = portfolioHoldings[ticker] || 0;
+                    const currentValue = currentShares * price;
+                    const targetValue = targetValues[ticker] || 0;
+                    
+                    const diff = targetValue - currentValue;
+
+                    // If Diff is positive (Underweight) AND we have cash, BUY
+                    if (diff > 1 && cash > 1 && price > 0) {
+                        // Max we can buy with current cash including costs
+                        // Cost = Val * Pct. Total Spend = Val + Cost = Val * (1 + Pct)
+                        const costFactor = 1 + (strategy.transactionCostPct / 100);
+                        const maxBuyableValue = cash / costFactor;
+                        
+                        // Buy the difference, or whatever cash allows
+                        const valToBuy = Math.min(diff, maxBuyableValue);
+                        
+                        if (valToBuy > 1) {
+                            const qtyToBuy = valToBuy / price;
+                            const txCost = valToBuy * (strategy.transactionCostPct / 100);
+                            
+                            // Execute Buy
+                            portfolioHoldings[ticker] = currentShares + qtyToBuy;
+                            cash -= (valToBuy + txCost);
+                            nav -= txCost;
+
+                            if (saveTransactions) {
+                                recordedTransactions.push({
+                                    date, ticker, action: 'BUY', price, quantity: qtyToBuy, totalValue: valToBuy, cost: txCost
+                                });
+                            }
+                        }
+                    }
+                });
             }
 
             simData.push({
