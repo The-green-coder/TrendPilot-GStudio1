@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { Card, Button, Select } from '../components/ui';
 import { StorageService } from '../services/storage';
@@ -42,7 +43,13 @@ export const BacktestEngine = () => {
   const downloadTransactionsCSV = () => {
       if (!result || result.transactions.length === 0) return;
 
-      const headers = ['Date', 'Ticker', 'Action', 'Price', 'Quantity', 'Total Value', 'Tx Cost'];
+      const headers = [
+          'Date', 'Ticker', 'Action', 'Price', 'Quantity', 'Total Value', 'Tx Cost',
+          'Signal Logic', 
+          'RiskOn Value', 'RiskOn Qty', 'RiskOn %',
+          'RiskOff Value', 'RiskOff Qty', 'RiskOff %'
+      ];
+      
       const rows = result.transactions.map(t => [
           t.date,
           t.ticker,
@@ -50,7 +57,14 @@ export const BacktestEngine = () => {
           t.price.toFixed(2),
           t.quantity.toFixed(4),
           t.totalValue.toFixed(2),
-          t.cost.toFixed(2)
+          t.cost.toFixed(2),
+          `"${t.signalReason || ''}"`,
+          (t.riskOnNotional || 0).toFixed(2),
+          (t.riskOnQty || 0).toFixed(4),
+          (t.riskOnPct || 0).toFixed(1) + '%',
+          (t.riskOffNotional || 0).toFixed(2),
+          (t.riskOffQty || 0).toFixed(4),
+          (t.riskOffPct || 0).toFixed(1) + '%'
       ]);
 
       const csvContent = [
@@ -134,8 +148,6 @@ export const BacktestEngine = () => {
         
         // Data Duration Check
         if (startDateIndex === -1 && strategy.backtestDuration !== 'Max') {
-            // Data is entirely older than cutoff, or entirely newer?? 
-            // Usually means stored data is too short.
             if (sortedDates.length > 0 && sortedDates[0] > cutoffDate) {
                  setDataWarning(`Warning: Stored market data for these symbols starts on ${sortedDates[0]}, but you requested a backtest starting from ${cutoffDate}. The results will only cover the available data range. Please go to Market Data Manager and click "Reload (Ensure 5Y)" to fetch deeper history.`);
             }
@@ -184,7 +196,7 @@ export const BacktestEngine = () => {
         }
         if(!benchmarkStartPrice) benchmarkStartPrice = 1;
 
-        // 6. Pre-calculate Indicators (MAs) using FULL history (including pre-simulation dates)
+        // 6. Pre-calculate Indicators (MAs) using FULL history
         const primaryRiskOnTicker = riskOnTickers[0];
         const primaryFullHistory = sortedDates.map(d => {
             const point = marketDataMap[primaryRiskOnTicker].get(d);
@@ -218,7 +230,9 @@ export const BacktestEngine = () => {
         // Initialize Holdings (Start with Cash)
         let cash = nav;
         
-        // Rebalancing Logic Helper
+        // Signal Reason String
+        let currentSignalReason = "Initial Allocation";
+
         const isRebalanceDay = (dateStr: string, index: number, freq: RebalanceFrequency): boolean => {
             if (index === 0) return true; // Always rebalance on day 1
             const currentDate = new Date(dateStr);
@@ -270,8 +284,6 @@ export const BacktestEngine = () => {
             const pPrimaryClose = pointPrimary ? pointPrimary.close : null;
             let targetRiskOnWeight = currentAllocations.riskOn; // Hold previous by default
 
-            // If we have price and it's a rebalance day (or we want to update signal daily but execute later)
-            // Ideally signal is checked daily, but we only ACT on rebalance day.
             if (pPrimaryClose !== null) {
                 const ma20 = getMA(20, date);
                 const ma25 = getMA(25, date);
@@ -281,18 +293,24 @@ export const BacktestEngine = () => {
                 if (activeRuleId === 'rule_1') {
                     if (ma25 && ma50 && ma100) {
                         let w = 0;
-                        if (pPrimaryClose > ma25) w += 0.25;
-                        if (pPrimaryClose > ma50) w += 0.50;
-                        if (pPrimaryClose > ma100) w += 0.25;
+                        let reasons = [];
+                        if (pPrimaryClose > ma25) { w += 0.25; reasons.push(`Close(${pPrimaryClose.toFixed(2)}) > MA25(${ma25.toFixed(2)})`); }
+                        if (pPrimaryClose > ma50) { w += 0.50; reasons.push(`> MA50(${ma50.toFixed(2)})`); }
+                        if (pPrimaryClose > ma100) { w += 0.25; reasons.push(`> MA100(${ma100.toFixed(2)})`); }
+                        if (reasons.length === 0) reasons.push("Close < All MAs");
                         targetRiskOnWeight = w;
+                        currentSignalReason = reasons.join(' & ');
                     }
                 } else if (activeRuleId === 'rule_2') {
                     if (ma20 && ma50 && ma100) {
                         let w = 0;
-                        if (pPrimaryClose > ma20) w += 0.50;
-                        if (pPrimaryClose > ma50) w += 0.25;
-                        if (pPrimaryClose > ma100) w += 0.25;
+                        let reasons = [];
+                        if (pPrimaryClose > ma20) { w += 0.50; reasons.push(`Close(${pPrimaryClose.toFixed(2)}) > MA20(${ma20.toFixed(2)})`); }
+                        if (pPrimaryClose > ma50) { w += 0.25; reasons.push(`> MA50(${ma50.toFixed(2)})`); }
+                        if (pPrimaryClose > ma100) { w += 0.25; reasons.push(`> MA100(${ma100.toFixed(2)})`); }
+                        if (reasons.length === 0) reasons.push("Close < All MAs");
                         targetRiskOnWeight = w;
+                        currentSignalReason = reasons.join(' & ');
                     }
                 }
             }
@@ -306,6 +324,12 @@ export const BacktestEngine = () => {
                 // 1. Calculate Target Dollar Amounts for every Asset
                 const targetValues: Record<string, number> = {};
                 
+                // Calculate Portfolio Snapshot for Reporting
+                const riskOnNotional = nav * currentAllocations.riskOn;
+                const riskOffNotional = nav * currentAllocations.riskOff;
+                const riskOnPct = currentAllocations.riskOn * 100;
+                const riskOffPct = currentAllocations.riskOff * 100;
+
                 // Risk On Targets
                 strategy.riskOnComponents.forEach(comp => {
                     const ticker = getTicker(comp.symbolId).trim();
@@ -321,6 +345,19 @@ export const BacktestEngine = () => {
                     const finalWeight = currentAllocations.riskOff * basketWeight;
                     targetValues[ticker] = nav * finalWeight;
                 });
+
+                // Calculate Target Quantities (Sum of shares for bucket stats)
+                let riskOnQty = 0;
+                let riskOffQty = 0;
+                
+                Object.keys(targetValues).forEach(t => {
+                    const price = currentExecutionPrices[t] || 1;
+                    const qty = targetValues[t] / price;
+                    const isRiskOn = strategy.riskOnComponents.some(c => getTicker(c.symbolId) === t);
+                    if(isRiskOn) riskOnQty += qty;
+                    else riskOffQty += qty;
+                });
+
 
                 // 2. Identify Deltas (Target - Current)
                 const involvedTickers = new Set([...Object.keys(portfolioHoldings), ...Object.keys(targetValues)]);
@@ -349,7 +386,10 @@ export const BacktestEngine = () => {
 
                         if (saveTransactions) {
                             recordedTransactions.push({
-                                date, ticker, action: 'SELL', price, quantity: qtyToSell, totalValue: valToSell, cost: txCost
+                                date, ticker, action: 'SELL', price, quantity: qtyToSell, totalValue: valToSell, cost: txCost,
+                                signalReason: currentSignalReason,
+                                riskOnNotional, riskOnQty, riskOnPct,
+                                riskOffNotional, riskOffQty, riskOffPct
                             });
                         }
                     }
@@ -380,7 +420,10 @@ export const BacktestEngine = () => {
 
                             if (saveTransactions) {
                                 recordedTransactions.push({
-                                    date, ticker, action: 'BUY', price, quantity: qtyToBuy, totalValue: valToBuy, cost: txCost
+                                    date, ticker, action: 'BUY', price, quantity: qtyToBuy, totalValue: valToBuy, cost: txCost,
+                                    signalReason: currentSignalReason,
+                                    riskOnNotional, riskOnQty, riskOnPct,
+                                    riskOffNotional, riskOffQty, riskOffPct
                                 });
                             }
                         }

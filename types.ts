@@ -96,6 +96,15 @@ export interface Transaction {
   quantity: number;
   totalValue: number;
   cost: number;
+  
+  // New columns for analysis
+  signalReason?: string;
+  riskOnNotional?: number;
+  riskOnQty?: number;
+  riskOnPct?: number;
+  riskOffNotional?: number;
+  riskOffQty?: number;
+  riskOffPct?: number;
 }
 
 export interface BacktestResult {
