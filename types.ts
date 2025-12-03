@@ -88,6 +88,16 @@ export interface Strategy {
   subStrategyAllocations?: { strategyId: string; weight: number }[];
 }
 
+export interface Transaction {
+  date: string;
+  ticker: string;
+  action: 'BUY' | 'SELL';
+  price: number;
+  quantity: number;
+  totalValue: number;
+  cost: number;
+}
+
 export interface BacktestResult {
   strategyId: string;
   runDate: string;
@@ -100,14 +110,7 @@ export interface BacktestResult {
   };
   navSeries: { date: string; value: number; benchmarkValue: number; riskOn: number; riskOff: number }[];
   allocations: { date: string; riskOn: number; riskOff: number }[];
-  transactions: {
-    date: string;
-    ticker: string;
-    action: 'BUY' | 'SELL';
-    price: number;
-    quantity: number;
-    cost: number;
-  }[];
+  transactions: Transaction[];
   latestAllocation?: {
       date: string;
       riskOn: number;

@@ -2,7 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { Card, Button, Select } from '../components/ui';
 import { StorageService } from '../services/storage';
-import { Strategy, BacktestResult, SymbolData, PriceType, MarketDataPoint } from '../types';
+import { Strategy, BacktestResult, SymbolData, PriceType, MarketDataPoint, Transaction, RebalanceFrequency } from '../types';
 import { analyzeBacktest } from '../services/geminiService';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -19,18 +19,64 @@ export const BacktestDashboard = () => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [dataWarning, setDataWarning] = useState('');
+  
+  // Backtest Options
+  const [saveTransactions, setSaveTransactions] = useState(false);
 
+  // Load initial state
   useEffect(() => {
+    loadData();
+  }, []);
+
+  const loadData = () => {
     const s = StorageService.getStrategies();
     const syms = StorageService.getSymbols();
     setStrategies(s);
     setSymbols(syms);
-    if(s.length > 0) setSelectedStrategyId(s[0].id);
-  }, []);
+    // If selected ID exists but is not in list (deleted), or no selection, pick first
+    if(s.length > 0 && (!selectedStrategyId || !s.find(strat => strat.id === selectedStrategyId))) {
+         setSelectedStrategyId(s[0].id);
+    }
+  };
 
   const getTicker = (id: string) => symbols.find(s => s.id === id)?.ticker || '';
 
+  const downloadTransactionsCSV = () => {
+      if (!result || result.transactions.length === 0) return;
+
+      const headers = ['Date', 'Ticker', 'Action', 'Price', 'Quantity', 'Total Value', 'Tx Cost'];
+      const rows = result.transactions.map(t => [
+          t.date,
+          t.ticker,
+          t.action,
+          t.price.toFixed(2),
+          t.quantity.toFixed(4),
+          t.totalValue.toFixed(2),
+          t.cost.toFixed(2)
+      ]);
+
+      const csvContent = [
+          headers.join(','),
+          ...rows.map(row => row.join(','))
+      ].join('\n');
+
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `transactions_${result.strategyId}_${result.runDate.split('T')[0]}.csv`);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+  };
+
   const runBacktest = async () => {
+    // CRITICAL: Reload strategies from storage immediately before running.
+    // This fixes the "Stale Strategy" issue where edits weren't reflected.
+    const freshStrategies = StorageService.getStrategies();
+    setStrategies(freshStrategies);
+    
     setIsRunning(true);
     setResult(null);
     setErrorMessage('');
@@ -38,7 +84,7 @@ export const BacktestDashboard = () => {
     setAiAnalysis('');
     
     try {
-        const strategy = strategies.find(s => s.id === selectedStrategyId);
+        const strategy = freshStrategies.find(s => s.id === selectedStrategyId);
         if(!strategy) throw new Error("Strategy not found");
 
         if (strategy.riskOnComponents.length === 0) throw new Error("Strategy must have at least one Risk On asset.");
@@ -93,12 +139,8 @@ export const BacktestDashboard = () => {
         
         // Check for Data Sufficiency
         if (startDateIndex === -1 && strategy.backtestDuration !== 'Max') {
-            // This means all our data is "newer" than the cutoff? Or "older"?
-            // If data starts in 2023, and cutoff is 2020, index will be 0.
-            // If we have data from 2024 only, cutoff 2020. Index is 0.
-            // We need to check if sortedDates[0] is significantly AFTER cutoffDate
             if (sortedDates.length > 0 && sortedDates[0] > cutoffDate) {
-                 setDataWarning(`Warning: Stored market data starts on ${sortedDates[0]}, but strategy requested data from ${cutoffDate}. The backtest period will be shorter than requested. Please go to Market Data Manager and Reload to fetch full 5Y history.`);
+                 setDataWarning(`Warning: Stored market data starts on ${sortedDates[0]}, but strategy requested data from ${cutoffDate}. The backtest period will be shorter than requested. Please go to Market Data Manager and Reload to fetch full history.`);
             }
         }
 
@@ -135,21 +177,18 @@ export const BacktestDashboard = () => {
                 const p = marketDataMap[t].get(d);
                 if(p) { price = p.close; break; }
             }
-            lastKnownPrices[t] = price || 1; // Default to 1 to prevent division by zero
+            lastKnownPrices[t] = price || 1; 
         });
 
-        // Benchmark Sync: 
-        // We find the price of the benchmark on the exact start date of simulation.
-        // We also normalize the benchmark NAV to equal Initial Capital on that day.
+        // Benchmark Sync
         let benchmarkStartPrice = 0;
-        // Find the first valid price for benchmark in the simulation window
         for(const d of simulationDates) {
              const p = marketDataMap[benchmarkTicker].get(d);
              if(p) { benchmarkStartPrice = p.close; break; }
         }
         if(!benchmarkStartPrice) benchmarkStartPrice = 1;
 
-        // 6. Pre-calculate Indicators (MAs) using FULL history (for warmup)
+        // 6. Pre-calculate Indicators (MAs) using FULL history
         const primaryRiskOnTicker = riskOnTickers[0];
         const primaryFullHistory = sortedDates.map(d => {
             const point = marketDataMap[primaryRiskOnTicker].get(d);
@@ -167,86 +206,83 @@ export const BacktestDashboard = () => {
              return sum / period;
         };
 
-        // 7. Simulation Loop
+        // 7. Simulation Loop Variables
         const totalOnAlloc = strategy.riskOnComponents.reduce((s, c) => s + c.allocation, 0) || 100;
         const totalOffAlloc = strategy.riskOffComponents.reduce((s, c) => s + c.allocation, 0) || 100;
 
-        const riskOnBasket = strategy.riskOnComponents.map(c => ({
-            ticker: getTicker(c.symbolId).trim(),
-            weight: c.allocation / totalOnAlloc
-        }));
-        const riskOffBasket = strategy.riskOffComponents.map(c => ({
-            ticker: getTicker(c.symbolId).trim(),
-            weight: c.allocation / totalOffAlloc
-        }));
-
         let nav = strategy.initialCapital;
         const simData = [];
-        let currentAllocations = { riskOn: 1.0, riskOff: 0.0 }; 
+        let currentAllocations = { riskOn: 1.0, riskOff: 0.0 }; // Start 100% Risk On default
         const activeRuleId = strategy.rules.length > 0 ? strategy.rules[0].ruleId : null;
+        
+        const recordedTransactions: Transaction[] = [];
+
+        // Portfolio Units Tracking (Asset Ticker -> Number of Shares)
+        let portfolioHoldings: Record<string, number> = {};
+        // Initialize Holdings (Cash to Risk On)
+        let cash = nav;
+        
+        // Rebalancing Logic Helper
+        const isRebalanceDay = (dateStr: string, index: number, freq: RebalanceFrequency): boolean => {
+            if (index === 0) return true; // Always rebalance on day 1
+            const currentDate = new Date(dateStr);
+            const prevDate = new Date(simulationDates[index - 1]);
+            
+            // Simple frequency checks based on Day/Month change
+            switch(freq) {
+                case RebalanceFrequency.DAILY: return true;
+                case RebalanceFrequency.WEEKLY: 
+                    // New week if current day < prev day (e.g. Mon < Fri) or large gap
+                    return currentDate.getDay() < prevDate.getDay() || (currentDate.getTime() - prevDate.getTime()) > 7 * 86400000;
+                case RebalanceFrequency.MONTHLY:
+                    return currentDate.getMonth() !== prevDate.getMonth();
+                case RebalanceFrequency.QUARTERLY:
+                     return Math.floor(currentDate.getMonth() / 3) !== Math.floor(prevDate.getMonth() / 3);
+                default: return false;
+            }
+        };
+
+        // Determine Direction Multiplier
+        const getDirMult = (dir: 'Long' | 'Short') => dir === 'Short' ? -1 : 1;
 
         for(let i = 0; i < simulationDates.length; i++) {
             const date = simulationDates[i];
             
-            // --- A. Portfolio Value Update ---
-            if (i > 0) {
-                const prevDate = simulationDates[i-1];
-                let basketReturnOn = 0;
-                let basketReturnOff = 0;
-
-                // Risk On Basket Return
-                riskOnBasket.forEach(item => {
-                    const currP = getExecutionPrice(item.ticker, date);
-                    const prevP = lastKnownPrices[item.ticker]; // Use last known
-                    
-                    if (currP) {
-                        const r = (currP - prevP) / prevP;
-                        basketReturnOn += r * item.weight;
-                        lastKnownPrices[item.ticker] = currP; // Update known
-                    }
-                });
-
-                // Risk Off Basket Return
-                if (riskOffBasket.length > 0) {
-                    riskOffBasket.forEach(item => {
-                        const currP = getExecutionPrice(item.ticker, date);
-                        const prevP = lastKnownPrices[item.ticker];
-                        
-                        if (currP) {
-                            const r = (currP - prevP) / prevP;
-                            basketReturnOff += r * item.weight;
-                            lastKnownPrices[item.ticker] = currP;
-                        }
-                    });
-                } else {
-                    basketReturnOff = 0; 
-                }
-
-                const portRet = (currentAllocations.riskOn * basketReturnOn) + (currentAllocations.riskOff * basketReturnOff);
-                nav = nav * (1 + portRet);
-            }
-
-            // --- B. Benchmark Value Update (Buy and Hold) ---
-            // Formula: (Current Price / Start Price) * Initial Capital
-            // We use strict Buy & Hold logic normalized to Initial Capital at start of sim.
-            let currentBmPrice = getExecutionPrice(benchmarkTicker, date);
-            if (!currentBmPrice) {
-                // Gap fill
-                currentBmPrice = lastKnownPrices[benchmarkTicker] || benchmarkStartPrice;
-            } else {
-                lastKnownPrices[benchmarkTicker] = currentBmPrice;
-            }
+            // --- A. Calculate Current Portfolio Value ---
+            // If i=0, we have cash. If i>0, we calculate based on holdings value.
+            let currentPortfolioValue = cash;
             
+            // Calculate value of current holdings
+            Object.keys(portfolioHoldings).forEach(ticker => {
+                const price = getExecutionPrice(ticker, date);
+                if (price) {
+                    const shares = portfolioHoldings[ticker];
+                    currentPortfolioValue += shares * price;
+                }
+                // If price missing, we assume last value (no change) or explicit logic
+                // For simplified backtest, we skip update if price missing but keep value same as prev?
+                // Better: Use lastKnownPrices
+                else {
+                    const lastP = lastKnownPrices[ticker];
+                    currentPortfolioValue += portfolioHoldings[ticker] * lastP;
+                }
+            });
+            
+            // Update NAV tracking
+            nav = currentPortfolioValue;
+
+            // --- B. Benchmark Value Update ---
+            let currentBmPrice = getExecutionPrice(benchmarkTicker, date);
+            if (!currentBmPrice) currentBmPrice = lastKnownPrices[benchmarkTicker] || benchmarkStartPrice;
+            lastKnownPrices[benchmarkTicker] = currentBmPrice;
             const benchmarkNAV = (currentBmPrice / benchmarkStartPrice) * strategy.initialCapital;
 
-
-            // --- C. Signal Generation (Close Price vs MAs) ---
+            // --- C. Signal Generation ---
             const pointPrimary = marketDataMap[primaryRiskOnTicker].get(date);
             const pPrimaryClose = pointPrimary ? pointPrimary.close : null;
-            
+            let targetRiskOnWeight = currentAllocations.riskOn;
+
             if (pPrimaryClose !== null) {
-                let targetRiskOnWeight = currentAllocations.riskOn;
-                
                 const ma20 = getMA(20, date);
                 const ma25 = getMA(25, date);
                 const ma50 = getMA(50, date);
@@ -271,9 +307,87 @@ export const BacktestDashboard = () => {
                 } else {
                     targetRiskOnWeight = 1.0;
                 }
+            }
+            
+            currentAllocations.riskOn = targetRiskOnWeight;
+            currentAllocations.riskOff = 1.0 - targetRiskOnWeight;
 
-                currentAllocations.riskOn = targetRiskOnWeight;
-                currentAllocations.riskOff = 1.0 - targetRiskOnWeight;
+            // --- D. Rebalancing Execution ---
+            if (isRebalanceDay(date, i, strategy.rebalanceFreq)) {
+                
+                // 1. Sell Everything first (conceptually) to get Cash
+                // In a real system we would net-off, but for simulation simple sell-all buy-new works
+                let tempCash = cash;
+                
+                // Sell existing
+                Object.keys(portfolioHoldings).forEach(ticker => {
+                    const qty = portfolioHoldings[ticker];
+                    if (qty !== 0) {
+                        const price = getExecutionPrice(ticker, date) || lastKnownPrices[ticker];
+                        const val = qty * price;
+                        const txCost = val * (strategy.transactionCostPct / 100);
+                        tempCash += val - txCost;
+
+                        if (saveTransactions) {
+                            recordedTransactions.push({
+                                date, ticker, action: 'SELL', price, quantity: qty, totalValue: val, cost: txCost
+                            });
+                        }
+                    }
+                });
+                
+                portfolioHoldings = {}; // Reset holdings
+                
+                // 2. Buy New Allocations
+                const riskOnAmt = tempCash * currentAllocations.riskOn;
+                const riskOffAmt = tempCash * currentAllocations.riskOff;
+
+                // Execute Risk On Buys
+                strategy.riskOnComponents.forEach(comp => {
+                    const ticker = getTicker(comp.symbolId).trim();
+                    const weight = (comp.allocation / totalOnAlloc); // Normalized within basket
+                    const amountToBuy = riskOnAmt * weight;
+                    
+                    if (amountToBuy > 0) {
+                        const price = getExecutionPrice(ticker, date) || lastKnownPrices[ticker];
+                        const txCost = amountToBuy * (strategy.transactionCostPct / 100);
+                        const netAmount = amountToBuy - txCost;
+                        const qty = netAmount / price;
+                        
+                        // Add to holdings
+                        portfolioHoldings[ticker] = (portfolioHoldings[ticker] || 0) + qty;
+                        
+                        if (saveTransactions) {
+                            recordedTransactions.push({
+                                date, ticker, action: 'BUY', price, quantity: qty, totalValue: amountToBuy, cost: txCost
+                            });
+                        }
+                    }
+                });
+
+                // Execute Risk Off Buys
+                strategy.riskOffComponents.forEach(comp => {
+                    const ticker = getTicker(comp.symbolId).trim();
+                    const weight = (comp.allocation / totalOffAlloc);
+                    const amountToBuy = riskOffAmt * weight;
+                    
+                    if (amountToBuy > 0) {
+                        const price = getExecutionPrice(ticker, date) || lastKnownPrices[ticker];
+                        const txCost = amountToBuy * (strategy.transactionCostPct / 100);
+                        const netAmount = amountToBuy - txCost;
+                        const qty = netAmount / price;
+                        
+                        portfolioHoldings[ticker] = (portfolioHoldings[ticker] || 0) + qty;
+                        
+                         if (saveTransactions) {
+                            recordedTransactions.push({
+                                date, ticker, action: 'BUY', price, quantity: qty, totalValue: amountToBuy, cost: txCost
+                            });
+                        }
+                    }
+                });
+
+                cash = 0; // All deployed (or remainder is negligible/ignored for simplicity)
             }
 
             simData.push({
@@ -314,7 +428,7 @@ export const BacktestDashboard = () => {
             },
             navSeries: simData,
             allocations: [],
-            transactions: [],
+            transactions: recordedTransactions,
             latestAllocation: {
                 date: lastAlloc.date,
                 riskOn: lastAlloc.riskOn,
@@ -353,16 +467,27 @@ export const BacktestDashboard = () => {
                 <h2 className="text-2xl font-bold text-white">Backtesting Engine</h2>
                 <p className="text-slate-400">Run simulations with real historical data.</p>
             </div>
-            <div className="flex gap-4 items-end bg-slate-900 p-2 rounded-lg border border-slate-800">
-                <Select 
-                    value={selectedStrategyId}
-                    onChange={(e) => setSelectedStrategyId(e.target.value)}
-                    options={strategies.map(s => ({ value: s.id, label: s.name }))}
-                    className="w-64"
-                />
-                <Button onClick={runBacktest} disabled={isRunning || !selectedStrategyId}>
-                    {isRunning ? 'Simulating...' : 'Run Backtest'}
-                </Button>
+            <div className="flex flex-col gap-2 items-end">
+                <div className="flex gap-4 items-end bg-slate-900 p-2 rounded-lg border border-slate-800">
+                    <Select 
+                        value={selectedStrategyId}
+                        onChange={(e) => setSelectedStrategyId(e.target.value)}
+                        options={strategies.map(s => ({ value: s.id, label: s.name }))}
+                        className="w-64"
+                    />
+                    <Button onClick={runBacktest} disabled={isRunning || !selectedStrategyId}>
+                        {isRunning ? 'Simulating...' : 'Run Backtest'}
+                    </Button>
+                </div>
+                 <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
+                    <input 
+                        type="checkbox" 
+                        checked={saveTransactions} 
+                        onChange={e => setSaveTransactions(e.target.checked)}
+                        className="rounded bg-slate-800 border-slate-600 text-emerald-500 focus:ring-emerald-500"
+                    />
+                    Save Transaction Data
+                </label>
             </div>
        </div>
 
@@ -414,7 +539,18 @@ export const BacktestDashboard = () => {
                         </div>
                     )}
                     
-                    <div className="pt-4 border-t border-slate-800">
+                    <div className="pt-4 border-t border-slate-800 space-y-3">
+                        {saveTransactions && result.transactions.length > 0 && (
+                             <Button 
+                                variant="secondary" 
+                                className="w-full text-sm"
+                                onClick={downloadTransactionsCSV}
+                            >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                                Download Trades (.CSV)
+                            </Button>
+                        )}
+
                         <Button 
                             variant="secondary" 
                             className="w-full flex justify-between"
