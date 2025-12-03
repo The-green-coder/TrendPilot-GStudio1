@@ -1,4 +1,5 @@
 
+
 // Domain Types
 
 export enum Currency {
@@ -105,6 +106,10 @@ export interface Transaction {
   riskOffNotional?: number;
   riskOffQty?: number;
   riskOffPct?: number;
+  
+  // NAV Tracking
+  strategyNav?: number;
+  benchmarkNav?: number;
 }
 
 export interface BacktestResult {

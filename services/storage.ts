@@ -11,7 +11,9 @@ const KEYS = {
 
 // IndexedDB Configuration (Async, for large Market Data)
 const DB_NAME = 'TrendPilotDB';
-const DB_VERSION = 2; // Bumped version to ensure schema refresh
+// FIXED VERSION: Do not bump this indiscriminately. 
+// Version 3 establishes the stable schema. Future updates should handle upgrades gracefully.
+const DB_VERSION = 3; 
 const STORE_NAME = 'market_data';
 
 // --- IndexedDB Helpers ---
@@ -22,14 +24,19 @@ const openDB = (): Promise<IDBDatabase> => {
             return;
         }
         const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+        
         request.onerror = () => {
             console.error("IndexedDB Open Error:", request.error);
             reject(request.error);
         };
+        
         request.onsuccess = () => resolve(request.result);
+        
         request.onupgradeneeded = (event) => {
             const db = (event.target as IDBOpenDBRequest).result;
+            // Create store only if it doesn't exist to PRESERVE data
             if (!db.objectStoreNames.contains(STORE_NAME)) {
+                console.log("Creating market_data object store...");
                 db.createObjectStore(STORE_NAME);
             }
         };

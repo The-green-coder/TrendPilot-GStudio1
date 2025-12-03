@@ -1,4 +1,5 @@
 
+
 import React, { useState, useEffect } from 'react';
 import { Card, Button, Select } from '../components/ui';
 import { StorageService } from '../services/storage';
@@ -45,6 +46,7 @@ export const BacktestEngine = () => {
 
       const headers = [
           'Date', 'Ticker', 'Action', 'Price', 'Quantity', 'Total Value', 'Tx Cost',
+          'Strategy NAV', 'Benchmark NAV',
           'Signal Logic', 
           'RiskOn Value', 'RiskOn Qty', 'RiskOn %',
           'RiskOff Value', 'RiskOff Qty', 'RiskOff %'
@@ -58,6 +60,8 @@ export const BacktestEngine = () => {
           t.quantity.toFixed(4),
           t.totalValue.toFixed(2),
           t.cost.toFixed(2),
+          (t.strategyNav || 0).toFixed(2),
+          (t.benchmarkNav || 0).toFixed(2),
           `"${t.signalReason || ''}"`,
           (t.riskOnNotional || 0).toFixed(2),
           (t.riskOnQty || 0).toFixed(4),
@@ -389,7 +393,9 @@ export const BacktestEngine = () => {
                                 date, ticker, action: 'SELL', price, quantity: qtyToSell, totalValue: valToSell, cost: txCost,
                                 signalReason: currentSignalReason,
                                 riskOnNotional, riskOnQty, riskOnPct,
-                                riskOffNotional, riskOffQty, riskOffPct
+                                riskOffNotional, riskOffQty, riskOffPct,
+                                strategyNav: nav,
+                                benchmarkNav: benchmarkNAV
                             });
                         }
                     }
@@ -423,7 +429,9 @@ export const BacktestEngine = () => {
                                     date, ticker, action: 'BUY', price, quantity: qtyToBuy, totalValue: valToBuy, cost: txCost,
                                     signalReason: currentSignalReason,
                                     riskOnNotional, riskOnQty, riskOnPct,
-                                    riskOffNotional, riskOffQty, riskOffPct
+                                    riskOffNotional, riskOffQty, riskOffPct,
+                                    strategyNav: nav,
+                                    benchmarkNav: benchmarkNAV
                                 });
                             }
                         }
