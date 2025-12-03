@@ -4,18 +4,19 @@ import { Layout } from './components/Layout';
 import { SymbolManager } from './pages/SymbolManager';
 import { MarketDataManager } from './pages/MarketData';
 import { StrategyBuilder } from './pages/StrategyBuilder';
-import { BacktestDashboard } from './pages/BacktestDashboard';
+import { BacktestEngine } from './pages/Backtest';
+import { Dashboard } from './pages/Dashboard';
 
 const App: React.FC = () => {
   return (
     <HashRouter>
       <Layout>
         <Routes>
-          <Route path="/" element={<BacktestDashboard />} />
+          <Route path="/" element={<Dashboard />} />
           <Route path="/symbols" element={<SymbolManager />} />
           <Route path="/market-data" element={<MarketDataManager />} />
           <Route path="/strategies" element={<StrategyBuilder />} />
-          <Route path="/backtest" element={<BacktestDashboard />} />
+          <Route path="/backtest" element={<BacktestEngine />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </Layout>

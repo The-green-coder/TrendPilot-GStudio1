@@ -25,7 +25,6 @@ export const MarketDataManager = () => {
   const checkDataStatus = async (syms: SymbolData[]) => {
       setLoadingStatus(true);
       const status: Record<string, boolean> = {};
-      // Parallel checks
       await Promise.all(syms.map(async (s) => {
           status[s.ticker] = await StorageService.hasMarketData(s.ticker);
       }));
@@ -38,7 +37,6 @@ export const MarketDataManager = () => {
   const handleClearData = async () => {
     if (confirm("Are you sure you want to delete ALL historical market data? This cannot be undone.")) {
         await StorageService.clearMarketData();
-        // Force refresh status
         const currentSymbols = StorageService.getSymbols();
         setSymbols(currentSymbols); 
         checkDataStatus(currentSymbols);
@@ -53,46 +51,45 @@ export const MarketDataManager = () => {
 
     try {
         if (type === 'RELOAD') {
-            // Note: We DO NOT clear data automatically anymore.
-            // This allows the user to "Resume" downloads for failed symbols.
-            
-            // Filter valid symbols
             const validSymbols = symbols.filter(s => !s.isList && s.ticker);
             const total = validSymbols.length;
             let successCount = 0;
             let failCount = 0;
             let skippedCount = 0;
 
-            // SERIAL PROCESSING (1 by 1)
-            // Critical for free proxies to avoid rate limits
+            const now = new Date();
+            // We want data at least 5 years old for valid backtests
+            const requiredDate = new Date();
+            requiredDate.setFullYear(now.getFullYear() - 5);
+            const requiredDateStr = requiredDate.toISOString().split('T')[0];
+
+            // SERIAL PROCESSING
             for (let i = 0; i < total; i++) {
                 const sym = validSymbols[i];
-                
-                // Smart Resume Logic:
-                // Check if data exists AND if it covers at least 4.5 years (approx 1600 days).
-                // If the user requests a 5Y backtest but only has 1Y data, we must re-download.
                 let shouldDownload = true;
                 const existingData = await StorageService.getMarketData(sym.ticker);
                 
-                if (existingData && existingData.length > 1600) {
-                    // We have sufficient history (> 4.5 years), so we can skip
-                    shouldDownload = false;
+                // Smart Check: Do we have data AND does it start early enough?
+                if (existingData && existingData.length > 0) {
+                    const firstDate = existingData[0].date;
+                    // If first date in DB is older than (or equal to) required date, we are good.
+                    // e.g. stored '2019-01-01', required '2020-01-01' -> Good.
+                    if (firstDate <= requiredDateStr) {
+                         shouldDownload = false;
+                    }
                 }
 
                 if (!shouldDownload) {
-                    setStatusMessage(`Skipping ${sym.ticker} (Sufficient data exists)...`);
+                    setStatusMessage(`Skipping ${sym.ticker} (Data covers 5Y+)...`);
                     skippedCount++;
                     successCount++; 
                     setProgress(Math.round(((i + 1) / total) * 100));
                     continue;
                 }
 
-                // 2. Fetch if missing or insufficient
                 setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total}) via ${provider}...`);
                 
                 try {
-                    // PASS PROVIDER ID AND CUSTOM KEY HERE
-                    // We fetch a bit more than 5y to ensure we have buffer for MAs
                     const data = await MarketDataService.fetchHistory(sym.ticker, '5y', '1d', provider, customApiKey);
                     
                     if (data && data.length > 0) {
@@ -114,8 +111,6 @@ export const MarketDataManager = () => {
 
                 setProgress(Math.round(((i + 1) / total) * 100));
                 
-                // Polite Delay: Wait 2.5 seconds between requests (Only needed for Free/Proxy)
-                // If EODHD, we can go faster.
                 if (i < total - 1) {
                     const delay = provider === 'eodhd' ? 200 : 2500;
                     setStatusMessage(`Waiting...`);
@@ -123,7 +118,7 @@ export const MarketDataManager = () => {
                 }
             }
 
-            setStatusMessage(`Completed. Updated: ${successCount - skippedCount}, Skipped (Sufficient): ${skippedCount}, Failed: ${failCount}`);
+            setStatusMessage(`Completed. Updated: ${successCount - skippedCount}, Skipped: ${skippedCount}, Failed: ${failCount}`);
             await checkDataStatus(symbols);
         } else {
              await sleep(1000);
@@ -161,7 +156,6 @@ export const MarketDataManager = () => {
                         </div>
                     </div>
                     
-                    {/* EODHD Specific Input */}
                     {provider === 'eodhd' && (
                         <div className="animate-in fade-in slide-in-from-top-2 duration-300">
                             <Input 
@@ -215,7 +209,6 @@ export const MarketDataManager = () => {
                     </div>
                 </div>
 
-                {/* Progress Section */}
                 {(isDownloading || progress > 0) && (
                     <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
                         <div className="flex justify-between text-sm mb-1">
