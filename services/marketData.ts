@@ -8,18 +8,7 @@ interface ProxyStrategy {
     fetch: (targetUrl: string) => Promise<string>;
 }
 
-// 1. AllOrigins (Wrapper Strategy) - Most Reliable
-// Returns JSON: { contents: "actual_response_string", status: { ... } }
-const fetchAllOrigins = async (target: string): Promise<string> => {
-    const url = `https://api.allorigins.win/get?url=${encodeURIComponent(target)}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`AllOrigins HTTP ${res.status}`);
-    const wrapper = await res.json();
-    if (!wrapper.contents) throw new Error("AllOrigins no content");
-    return wrapper.contents; 
-};
-
-// 2. CorsProxy.io (Direct Strategy) - Fastest
+// 1. CorsProxy.io (Direct Strategy) - Often the fastest
 const fetchCorsProxy = async (target: string): Promise<string> => {
     const url = `https://corsproxy.io/?${encodeURIComponent(target)}`;
     const res = await fetch(url);
@@ -27,18 +16,26 @@ const fetchCorsProxy = async (target: string): Promise<string> => {
     return await res.text();
 };
 
-// 3. CodeTabs (Direct Strategy) - Backup
-const fetchCodeTabs = async (target: string): Promise<string> => {
-    const url = `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`;
+// 2. AllOrigins Raw (Direct Strategy) - Reliable
+const fetchAllOriginsRaw = async (target: string): Promise<string> => {
+    const url = `https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`CodeTabs HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`AllOrigins HTTP ${res.status}`);
+    return await res.text();
+};
+
+// 3. ThingProxy (Direct Strategy) - Good Backup
+const fetchThingProxy = async (target: string): Promise<string> => {
+    const url = `https://thingproxy.freeboard.io/fetch/${target}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`ThingProxy HTTP ${res.status}`);
     return await res.text();
 };
 
 const PROXIES: ProxyStrategy[] = [
-    { name: 'allorigins', fetch: fetchAllOrigins },
     { name: 'corsproxy', fetch: fetchCorsProxy },
-    { name: 'codetabs', fetch: fetchCodeTabs },
+    { name: 'allorigins-raw', fetch: fetchAllOriginsRaw },
+    { name: 'thingproxy', fetch: fetchThingProxy },
 ];
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -48,40 +45,41 @@ export const MarketDataService = {
   async fetchHistory(ticker: string, range: string = '5y', interval: string = '1d'): Promise<MarketDataPoint[]> {
     const cleanTicker = ticker.trim().toUpperCase().replace(/[^A-Z0-9^.-]/g, '');
     
-    // Yahoo URL Construction
-    // timestamps prevent caching
-    const targetUrl = `${YAHOO_BASE}${cleanTicker}?interval=${interval}&range=${range}&events=div,splits&includeAdjustedClose=true&_=${Date.now()}`;
+    // Simplified Yahoo URL to reduce chance of blocking (removed events/adjustedClose)
+    const targetUrl = `${YAHOO_BASE}${cleanTicker}?interval=${interval}&range=${range}`;
     
     let lastError: any;
 
     // Try each proxy strategy in order
     for (const proxy of PROXIES) {
         try {
-            // console.log(`[MarketData] Fetching ${cleanTicker} via ${proxy.name}...`);
-            
-            // 1. Fetch raw string using specific proxy strategy
+            // Random delay 100-300ms to be polite and avoid local burst
+            await sleep(100 + Math.random() * 200);
+
             const responseText = await proxy.fetch(targetUrl);
 
-            // 2. Validation
-            if (!responseText || responseText.length < 50 || responseText.trim().startsWith('<')) {
-                throw new Error("Invalid/HTML response");
+            // Validation: Check for empty or HTML response
+            if (!responseText || responseText.length < 50) {
+                 throw new Error("Empty response");
+            }
+            if (responseText.trim().startsWith('<') || responseText.includes('<!DOCTYPE html>')) {
+                throw new Error("HTML/Error Page detected (Proxy blocked)");
             }
 
-            // 3. Parse Yahoo JSON
+            // Parse Yahoo JSON
             let json;
             try {
                 json = JSON.parse(responseText);
             } catch (e) {
-                throw new Error("JSON Parse Error");
+                throw new Error("JSON Parse Failed");
             }
 
-            // 4. Check Yahoo Logic Errors
+            // Logic Error Check
             if (json.chart?.error) {
-                // If symbol is not found, DO NOT retry. It's a waste of time.
                 const code = json.chart.error.code;
                 if (code === 'Not Found' || code === 'Not Found: No data found, symbol may be delisted') {
                     console.warn(`Symbol ${cleanTicker} not found on Yahoo Finance.`);
-                    return []; // Return empty to indicate "Finished but empty"
+                    return []; 
                 }
                 throw new Error(`Yahoo API Error: ${JSON.stringify(json.chart.error)}`);
             }
@@ -89,13 +87,10 @@ export const MarketDataService = {
             const result = json.chart?.result?.[0];
             if (!result) throw new Error('No result object in Yahoo response');
 
-            // 5. Transform Data
             const timestamps = result.timestamp;
             const quote = result.indicators.quote[0];
             
-            if (!timestamps || !quote) {
-                return []; 
-            }
+            if (!timestamps || !quote) return []; 
 
             const data: MarketDataPoint[] = [];
             const closes = quote.close;
@@ -105,7 +100,6 @@ export const MarketDataService = {
             const volumes = quote.volume;
 
             for (let j = 0; j < timestamps.length; j++) {
-                // Filter out nulls (common in Yahoo data)
                 if (timestamps[j] && closes[j] !== null && closes[j] !== undefined) {
                     data.push({
                         date: new Date(timestamps[j] * 1000).toISOString().split('T')[0],
@@ -120,18 +114,15 @@ export const MarketDataService = {
 
             if (data.length === 0) throw new Error("Parsed data is empty");
             
-            // Success!
             return data;
 
         } catch (error: any) {
             // console.warn(`Proxy ${proxy.name} failed for ${cleanTicker}:`, error.message);
             lastError = error;
-            // Wait slightly before switching proxies to be polite
-            await sleep(200);
         }
     }
 
-    console.error(`All proxies failed for ${cleanTicker}. Last Error:`, lastError);
+    // console.error(`All proxies failed for ${cleanTicker}. Last Error:`, lastError);
     throw lastError || new Error("All proxies failed");
   },
 
