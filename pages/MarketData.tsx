@@ -34,26 +34,50 @@ export const MarketDataManager = () => {
 
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+  const handleClearData = async () => {
+    if (confirm("Are you sure you want to delete ALL historical market data? This cannot be undone.")) {
+        await StorageService.clearMarketData();
+        // Force refresh status
+        const currentSymbols = StorageService.getSymbols();
+        setSymbols(currentSymbols); 
+        checkDataStatus(currentSymbols);
+        setStatusMessage("Database cleared.");
+    }
+  };
+
   const handleDownload = async (type: 'RELOAD' | 'INTRADAY' | 'NAV') => {
     setIsDownloading(true);
     setProgress(0);
-    setStatusMessage(type === 'RELOAD' ? 'Initializing database connection...' : 'Updating...');
+    setStatusMessage(type === 'RELOAD' ? 'Initializing...' : 'Updating...');
 
     try {
         if (type === 'RELOAD') {
-            await StorageService.clearMarketData();
+            // Note: We DO NOT clear data automatically anymore.
+            // This allows the user to "Resume" downloads for failed symbols.
             
             // Filter valid symbols
             const validSymbols = symbols.filter(s => !s.isList && s.ticker);
             const total = validSymbols.length;
             let successCount = 0;
             let failCount = 0;
+            let skippedCount = 0;
 
             // SERIAL PROCESSING (1 by 1)
             // Critical for free proxies to avoid rate limits
             for (let i = 0; i < total; i++) {
                 const sym = validSymbols[i];
                 
+                // 1. Check if data already exists (Resume logic)
+                const exists = await StorageService.hasMarketData(sym.ticker);
+                if (exists) {
+                    setStatusMessage(`Skipping ${sym.ticker} (Already downloaded)...`);
+                    skippedCount++;
+                    successCount++; // Count as success for progress purposes
+                    setProgress(Math.round(((i + 1) / total) * 100));
+                    continue;
+                }
+
+                // 2. Fetch if missing
                 setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total})...`);
                 
                 try {
@@ -84,7 +108,7 @@ export const MarketDataManager = () => {
                 }
             }
 
-            setStatusMessage(`Completed. Success: ${successCount}, Failed: ${failCount}`);
+            setStatusMessage(`Completed. New: ${successCount - skippedCount}, Skipped: ${skippedCount}, Failed: ${failCount}`);
             await checkDataStatus(symbols);
         } else {
              await sleep(1000);
@@ -124,16 +148,23 @@ export const MarketDataManager = () => {
                 <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-4">
                     <h3 className="text-lg font-medium text-slate-200">Data Operations</h3>
                     <div className="text-sm text-yellow-500/80 bg-yellow-500/10 p-2 rounded">
-                        Note: "Reload" fetches real data from Yahoo Finance via proxies. 
-                        Process is throttled (2s delay) to ensure success.
+                        Note: "Reload" will fetch <strong>missing</strong> data. Existing data is preserved.
+                        Use "Clear Data" to delete everything and start fresh.
                     </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <Button 
                             variant="secondary" 
                             onClick={() => handleDownload('RELOAD')}
                             disabled={isDownloading}
                         >
-                           Reload Market Data
+                           Reload (Fill Missing)
+                        </Button>
+                         <Button 
+                            variant="danger" 
+                            onClick={handleClearData}
+                            disabled={isDownloading}
+                        >
+                           Clear Data (Reset)
                         </Button>
                         <Button 
                             variant="secondary" 
