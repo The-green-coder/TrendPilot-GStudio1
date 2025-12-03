@@ -32,10 +32,12 @@ export const MarketDataManager = () => {
       setLoadingStatus(false);
   };
 
+  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
   const handleDownload = async (type: 'RELOAD' | 'INTRADAY' | 'NAV') => {
     setIsDownloading(true);
     setProgress(0);
-    setStatusMessage(type === 'RELOAD' ? 'Initializing download...' : 'Updating...');
+    setStatusMessage(type === 'RELOAD' ? 'Initializing database connection...' : 'Updating...');
 
     try {
         if (type === 'RELOAD') {
@@ -44,43 +46,48 @@ export const MarketDataManager = () => {
             // Filter valid symbols
             const validSymbols = symbols.filter(s => !s.isList && s.ticker);
             const total = validSymbols.length;
-            let processed = 0;
             let successCount = 0;
             let failCount = 0;
 
-            // Process in batches of 2 to be faster but polite
-            const BATCH_SIZE = 2;
-            
-            for (let i = 0; i < total; i += BATCH_SIZE) {
-                const batch = validSymbols.slice(i, i + BATCH_SIZE);
+            // SERIAL PROCESSING (1 by 1)
+            // Critical for free proxies to avoid rate limits
+            for (let i = 0; i < total; i++) {
+                const sym = validSymbols[i];
                 
-                setStatusMessage(`Fetching batch ${i + 1}-${Math.min(i + BATCH_SIZE, total)} of ${total}...`);
+                setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total})...`);
                 
-                await Promise.all(batch.map(async (sym) => {
-                    try {
-                        const data = await MarketDataService.fetchHistory(sym.ticker, '5y', '1d');
-                        if (data && data.length > 0) {
-                            const saved = await StorageService.saveMarketData(sym.ticker, data);
-                            if (saved) successCount++;
-                            else failCount++;
+                try {
+                    const data = await MarketDataService.fetchHistory(sym.ticker, '5y', '1d');
+                    if (data && data.length > 0) {
+                        setStatusMessage(`Saving ${sym.ticker} to database...`);
+                        const saved = await StorageService.saveMarketData(sym.ticker, data);
+                        if (saved) {
+                            successCount++;
                         } else {
+                            console.error(`Database write failed for ${sym.ticker}`);
                             failCount++;
                         }
-                    } catch (err) {
+                    } else {
                         failCount++;
-                        console.error(`Failed ${sym.ticker}`, err);
                     }
-                }));
+                } catch (err) {
+                    failCount++;
+                    console.error(`Failed ${sym.ticker}`, err);
+                }
 
-                processed += batch.length;
-                setProgress(Math.round((processed / total) * 100));
+                setProgress(Math.round(((i + 1) / total) * 100));
+                
+                // Polite Delay: Wait 2 seconds between requests
+                if (i < total - 1) {
+                    setStatusMessage(`Waiting (Rate Limit Prevention)...`);
+                    await sleep(2000);
+                }
             }
 
             setStatusMessage(`Completed. Success: ${successCount}, Failed: ${failCount}`);
             await checkDataStatus(symbols);
         } else {
-             // Mock update for other types for now
-             await new Promise(r => setTimeout(r, 1000));
+             await sleep(1000);
              setProgress(100);
              setStatusMessage('Update Completed.');
         }
@@ -117,7 +124,8 @@ export const MarketDataManager = () => {
                 <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-4">
                     <h3 className="text-lg font-medium text-slate-200">Data Operations</h3>
                     <div className="text-sm text-yellow-500/80 bg-yellow-500/10 p-2 rounded">
-                        Note: "Reload" fetches real data from Yahoo Finance via proxies.
+                        Note: "Reload" fetches real data from Yahoo Finance via proxies. 
+                        Process is throttled (2s delay) to ensure success.
                     </div>
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                         <Button 
@@ -164,7 +172,7 @@ export const MarketDataManager = () => {
 
             <Card>
                 <div className="flex justify-between items-center mb-4">
-                     <h3 className="font-semibold text-slate-200">Data Health</h3>
+                     <h3 className="font-semibold text-slate-200">Data Health (IndexedDB)</h3>
                      {loadingStatus && <span className="text-xs text-slate-500 animate-pulse">Checking...</span>}
                 </div>
                 

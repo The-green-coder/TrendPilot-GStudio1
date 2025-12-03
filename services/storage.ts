@@ -22,7 +22,10 @@ const openDB = (): Promise<IDBDatabase> => {
             return;
         }
         const request = window.indexedDB.open(DB_NAME, DB_VERSION);
-        request.onerror = () => reject(request.error);
+        request.onerror = () => {
+            console.error("IndexedDB Open Error:", request.error);
+            reject(request.error);
+        };
         request.onsuccess = () => resolve(request.result);
         request.onupgradeneeded = (event) => {
             const db = (event.target as IDBOpenDBRequest).result;
@@ -34,17 +37,25 @@ const openDB = (): Promise<IDBDatabase> => {
 };
 
 const dbOp = async (operation: (store: IDBObjectStore) => IDBRequest): Promise<any> => {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const request = operation(store);
-        
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        
-        tx.oncomplete = () => db.close();
-    });
+    try {
+        const db = await openDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            const request = operation(store);
+            
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => {
+                console.error("IndexedDB Op Error:", request.error);
+                reject(request.error);
+            };
+            
+            tx.oncomplete = () => db.close();
+        });
+    } catch (e) {
+        console.error("DB Operation Failed:", e);
+        throw e;
+    }
 };
 
 
@@ -140,10 +151,11 @@ export const StorageService = {
   // --- Real Market Data Storage (IndexedDB) ---
   saveMarketData: async (ticker: string, data: MarketDataPoint[]): Promise<boolean> => {
       try {
+          // Store data in IndexedDB (The Browser's Database)
           await dbOp(store => store.put(data, ticker));
           return true;
       } catch (e) {
-          console.error("IndexedDB Save Error", e);
+          console.error(`IndexedDB Save Error for ${ticker}:`, e);
           return false;
       }
   },
@@ -153,7 +165,7 @@ export const StorageService = {
           const data = await dbOp(store => store.get(ticker));
           return data || null;
       } catch (e) {
-          console.error("IndexedDB Get Error", e);
+          console.error(`IndexedDB Get Error for ${ticker}:`, e);
           return null;
       }
   },
