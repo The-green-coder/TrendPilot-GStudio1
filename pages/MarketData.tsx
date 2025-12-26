@@ -39,7 +39,6 @@ export const MarketDataManager = () => {
       for (const s of syms) {
           const data = await StorageService.getMarketData(s.ticker);
           if (data && data.length > 0) {
-              // Ensure data is sorted to accurately pick start and end dates
               const sorted = [...data].sort((a, b) => a.date.localeCompare(b.date));
               status[s.ticker] = { 
                   exists: true, 
@@ -74,8 +73,9 @@ export const MarketDataManager = () => {
 
         for (let i = 0; i < targets.length; i++) {
             const sym = targets[i];
-            setStatusMessage(`Downloading ${sym.ticker} (${i+1}/${targets.length})...`);
+            setStatusMessage(`Downloading & Cleaning ${sym.ticker} (${i+1}/${targets.length})...`);
             try {
+                // The MarketDataService.fetchHistory now includes the cleaning pipeline
                 const data = await MarketDataService.fetchHistory(sym.ticker, 'max', '1d', provider, customApiKey);
                 if (data.length > 0) {
                     await StorageService.saveMarketData(sym.ticker, data);
@@ -84,11 +84,10 @@ export const MarketDataManager = () => {
                 console.error(`Download failed: ${sym.ticker}`, e);
             }
             setProgress(Math.round(((i + 1) / targets.length) * 100));
-            // Small pause to avoid hitting rate limits too hard and to update UI
             await new Promise(r => setTimeout(r, 200));
         }
 
-        setStatusMessage("Synchronization Successful.");
+        setStatusMessage("Synchronization & Data Cleaning Successful.");
         await loadSymbolsAndStatus();
     } catch (e) {
       setStatusMessage("Critical sync failure.");
@@ -101,7 +100,7 @@ export const MarketDataManager = () => {
     <div className="space-y-6">
        <div>
           <h2 className="text-2xl font-bold text-white tracking-tight">Market Data Center</h2>
-          <p className="text-slate-400">Manage persistence for your backtest universe.</p>
+          <p className="text-slate-400">Manage persistence for your backtest universe with automated data cleaning.</p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -126,7 +125,10 @@ export const MarketDataManager = () => {
 
                 <div className="p-5 bg-slate-950/50 rounded-xl border border-slate-800 space-y-5">
                     <div className="flex justify-between items-center">
-                        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Persistence Status</h3>
+                        <div className="space-y-1">
+                            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Persistence Status</h3>
+                            <p className="text-[10px] text-emerald-500/80 font-medium">Automatic Spike & Glitch Filtering Active</p>
+                        </div>
                         <div className="flex items-center gap-2 text-[10px] font-mono">
                             <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
                             <span className="text-emerald-400 uppercase font-bold">Local Sync Connected</span>
@@ -179,8 +181,8 @@ export const MarketDataManager = () => {
                                     <th className="px-3 py-3 border-b border-slate-800">Symbol</th>
                                     <th className="px-3 py-3 border-b border-slate-800 text-center">Status</th>
                                     <th className="px-3 py-3 border-b border-slate-800 text-right">Records</th>
-                                    <th className="px-3 py-3 border-b border-slate-800">MktData StartDate</th>
-                                    <th className="px-3 py-3 border-b border-slate-800">MktData End Date</th>
+                                    <th className="px-3 py-3 border-b border-slate-800">Start Date</th>
+                                    <th className="px-3 py-3 border-b border-slate-800">End Date</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-800/50">

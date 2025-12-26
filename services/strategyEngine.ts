@@ -80,7 +80,7 @@ export const StrategyEngine = {
         }
 
         let sIdx = startDate ? sortedDates.findIndex(d => d >= startDate) : firstCommonIdx;
-        if (sIdx < firstCommonIdx) sIdx = firstCommonIdx;
+        if (sIdx === -1 || sIdx < firstCommonIdx) sIdx = firstCommonIdx;
         let eIdx = endDate ? sortedDates.findIndex(d => d >= endDate) : sortedDates.length - 1;
         if (eIdx === -1) eIdx = sortedDates.length - 1;
 
@@ -104,20 +104,28 @@ export const StrategyEngine = {
         const primaryTicker = riskOnTickers[0];
         const getMA = (period: number, date: string) => {
             const idx = sortedDates.indexOf(date);
-            if (idx < period || idx === -1) return null;
+            if (idx === -1) return null;
+            
+            // Refinement: If history is shorter than period, use what we have to prevent zero-signal start
+            const actualLookback = Math.min(idx, period);
+            if (actualLookback < 5) return null; 
+
             let sum = 0, count = 0;
-            for (let i = 1; i <= period; i++) {
+            for (let i = 1; i <= actualLookback; i++) {
                 const p = getSafePrice(primaryTicker, sortedDates[idx - i]);
                 if (p > 0) { sum += p; count++; }
             }
-            return count === period ? sum / period : null;
+            return count > 0 ? sum / count : null;
         };
 
         const getMomentum = (period: number, date: string): number | null => {
             const idx = sortedDates.indexOf(date);
-            if (idx <= period || idx === -1) return null;
+            if (idx === -1) return null;
+            const lookback = Math.min(idx, period);
+            if (lookback < 5) return null;
+
             const pNow = getSafePrice(primaryTicker, sortedDates[idx - 1]);
-            const pThen = getSafePrice(primaryTicker, sortedDates[idx - 1 - period]);
+            const pThen = getSafePrice(primaryTicker, sortedDates[idx - 1 - lookback]);
             return (pNow > 0 && pThen > 0) ? (pNow / pThen) - 1 : null;
         };
 
@@ -134,7 +142,6 @@ export const StrategyEngine = {
                     const diff = curr.getTime() - epoch.getTime();
                     const weekIdx = Math.floor(diff / (7 * 24 * 3600 * 1000));
                     const prevWeekIdx = Math.floor((prev.getTime() - epoch.getTime()) / (7 * 24 * 3600 * 1000));
-                    // Trigger if a new week starts AND the absolute week counter is even
                     return (weekIdx !== prevWeekIdx) && (weekIdx % 2 === 0);
                 }
                 case RebalanceFrequency.MONTHLY: return curr.getMonth() !== prev.getMonth();
@@ -215,14 +222,13 @@ export const StrategyEngine = {
                 }
             }
 
-            // D. Execute Rebalance (Optimized for transaction costs)
+            // D. Execute Rebalance
             let rebalancedThisDay = false;
             if (pendingRebalanceDay !== null && i >= pendingRebalanceDay) {
                 rebalancedThisDay = true;
                 const costMultiplier = (1 + (strategy.transactionCostPct + strategy.slippagePct) / 100);
                 const sellMultiplier = (1 - (strategy.transactionCostPct + strategy.slippagePct) / 100);
                 
-                // SELL Phase: Liquidate overweight assets to generate cash
                 Object.keys(holdings).forEach(t => {
                     const price = getExecutionPrice(t, date);
                     if (price <= 0) return;
@@ -240,8 +246,6 @@ export const StrategyEngine = {
                     }
                 });
 
-                // BUY Phase: Reinvest available cash into underweight assets
-                // We must solve: targetVal_including_fees = cash_available
                 Object.keys(targetWeights).forEach(t => {
                     const price = getExecutionPrice(t, date);
                     if (price <= 0) return;
@@ -250,12 +254,9 @@ export const StrategyEngine = {
                     if (targetVal > currentVal + 1) {
                         let buyValDesired = targetVal - currentVal;
                         let totalCostForDesired = buyValDesired * (costMultiplier - 1);
-                        
-                        // If we don't have enough cash for desired buy + its fees, reduce buy amount
                         if (buyValDesired + totalCostForDesired > cash) {
                             buyValDesired = cash / costMultiplier;
                         }
-
                         if (buyValDesired > 1) {
                             const cost = buyValDesired * (costMultiplier - 1);
                             const qty = buyValDesired / price;

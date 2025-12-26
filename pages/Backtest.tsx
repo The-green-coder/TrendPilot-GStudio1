@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { Card, Button, Select } from '../components/ui';
+import { Card, Button, Select, Input } from '../components/ui';
 import { StorageService } from '../services/storage';
 import { Strategy, BacktestResult, SymbolData, RebalanceFrequency } from '../types';
 import { StrategyEngine, SimResultPoint, SimTrade } from '../services/strategyEngine';
@@ -22,6 +22,12 @@ export const BacktestEngine = () => {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [symbols, setSymbols] = useState<SymbolData[]>([]);
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
+  const [selectedDuration, setSelectedDuration] = useState<string>('1Y');
+  
+  // Custom date range state
+  const [customStartDate, setCustomStartDate] = useState<string>(new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0]);
+  const [customEndDate, setCustomEndDate] = useState<string>(new Date().toISOString().split('T')[0]);
+
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [detailedResult, setDetailedResult] = useState<{ trades: SimTrade[], regimeSwitches: any[] } | null>(null);
@@ -37,7 +43,10 @@ export const BacktestEngine = () => {
     const s = StorageService.getStrategies();
     setStrategies(s);
     setSymbols(StorageService.getSymbols());
-    if (s.length > 0 && !selectedStrategyId) setSelectedStrategyId(s[0].id);
+    if (s.length > 0 && !selectedStrategyId) {
+      setSelectedStrategyId(s[0].id);
+      setSelectedDuration(s[0].backtestDuration || '1Y');
+    }
   };
 
   const calculateFullStats = (slice: SimResultPoint[], trades: SimTrade[], switches: any[]): ComparisonStats => {
@@ -126,7 +135,25 @@ export const BacktestEngine = () => {
     try {
         const strat = strategies.find(s => s.id === selectedStrategyId);
         if (!strat) throw new Error("Select a strategy");
-        const sim = await StrategyEngine.runSimulation(strat, symbols);
+
+        // Calculate Start/End Date based on Selected Duration
+        let startDate: string | undefined = undefined;
+        let endDate: string | undefined = undefined;
+
+        if (selectedDuration === 'Custom') {
+            startDate = customStartDate;
+            endDate = customEndDate;
+        } else if (selectedDuration !== 'Max') {
+            const daysMap: Record<string, number> = { 
+                '3M': 90, '6M': 180, '1Y': 365, '2Y': 730, '3Y': 1095, '5Y': 1825, '10Y': 3650 
+            };
+            const d = new Date();
+            d.setDate(d.getDate() - (daysMap[selectedDuration] || 365));
+            startDate = d.toISOString().split('T')[0];
+            endDate = new Date().toISOString().split('T')[0];
+        }
+
+        const sim = await StrategyEngine.runSimulation(strat, symbols, startDate, endDate);
         setDetailedResult({ trades: sim.trades, regimeSwitches: sim.regimeSwitches });
         setResult({
             strategyId: strat.id, runDate: new Date().toISOString(),
@@ -165,26 +192,85 @@ export const BacktestEngine = () => {
          }
        `}</style>
 
-       <div className="flex justify-between items-end">
-            <div>
+       <div className="flex flex-col xl:flex-row justify-between items-end gap-4">
+            <div className="w-full xl:w-auto">
                 <h2 className="text-2xl font-bold text-white tracking-tight">Backtesting Engine</h2>
-                <p className="text-slate-400">Deep quant analysis with fully flexible window selection.</p>
+                <p className="text-slate-400 text-sm">Quant analysis with standard tenors and dynamic slicing.</p>
             </div>
-            <div className="flex gap-4 items-end bg-slate-900 p-3 rounded-xl border border-slate-800">
-                <Select value={selectedStrategyId} onChange={e => setSelectedStrategyId(e.target.value)} options={strategies.map(s => ({ value: s.id, label: s.name }))} className="w-64" />
-                <Button onClick={runBacktest} disabled={isRunning}>{isRunning ? 'Simulating...' : 'Run Analysis'}</Button>
+            <div className="flex flex-wrap gap-3 items-end bg-slate-900 p-4 rounded-xl border border-slate-800 shadow-2xl w-full xl:w-auto">
+                <Select 
+                    label="Strategy"
+                    value={selectedStrategyId} 
+                    onChange={e => setSelectedStrategyId(e.target.value)} 
+                    options={strategies.map(s => ({ value: s.id, label: s.name }))} 
+                    className="w-full sm:w-56" 
+                />
+                <Select
+                    label="Duration"
+                    value={selectedDuration}
+                    onChange={e => setSelectedDuration(e.target.value)}
+                    options={[
+                        { value: '3M', label: '3 Months' },
+                        { value: '6M', label: '6 Months' },
+                        { value: '1Y', label: '1 Year' },
+                        { value: '2Y', label: '2 Years' },
+                        { value: '3Y', label: '3 Years' },
+                        { value: '5Y', label: '5 Years' },
+                        { value: '10Y', label: '10 Years' },
+                        { value: 'Max', label: 'Max History' },
+                        { value: 'Custom', label: 'Custom Range' }
+                    ]}
+                    className="w-full sm:w-36"
+                />
+                
+                {selectedDuration === 'Custom' && (
+                    <>
+                        <Input 
+                            type="date" 
+                            label="From" 
+                            value={customStartDate} 
+                            onChange={e => setCustomStartDate(e.target.value)} 
+                            className="w-full sm:w-36"
+                        />
+                        <Input 
+                            type="date" 
+                            label="To" 
+                            value={customEndDate} 
+                            onChange={e => setCustomEndDate(e.target.value)} 
+                            className="w-full sm:w-36"
+                        />
+                    </>
+                )}
+
+                <Button onClick={runBacktest} disabled={isRunning} className="h-10 px-6 w-full sm:w-auto">
+                    {isRunning ? 'Simulating...' : 'Run Analysis'}
+                </Button>
             </div>
        </div>
 
        {errorMessage && <Card className="border-red-500/50 bg-red-950/20 text-red-200">{errorMessage}</Card>}
 
        {result && currentStats && (
-           <div className="space-y-6">
+           <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                    <Card><div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Total Return</div><div className="text-2xl font-mono text-emerald-400">{currentStats.strategy.totalReturn.toFixed(1)}%</div></Card>
-                    <Card><div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Ann. CAGR</div><div className="text-2xl font-mono text-white">{currentStats.strategy.cagr.toFixed(1)}%</div></Card>
-                    <Card><div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Max Drawdown</div><div className="text-2xl font-mono text-red-400">-{currentStats.strategy.maxDD.toFixed(1)}%</div></Card>
-                    <Card><div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Sharpe Ratio</div><div className="text-2xl font-mono text-indigo-400">{currentStats.strategy.sharpe.toFixed(2)}</div></Card>
+                    <Card className="bg-slate-900/60 border-slate-800">
+                        <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Total Window Return</div>
+                        <div className={`text-2xl font-mono ${currentStats.strategy.totalReturn >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                            {currentStats.strategy.totalReturn.toFixed(1)}%
+                        </div>
+                    </Card>
+                    <Card className="bg-slate-900/60 border-slate-800">
+                        <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Window Ann. CAGR</div>
+                        <div className="text-2xl font-mono text-white">{currentStats.strategy.cagr.toFixed(1)}%</div>
+                    </Card>
+                    <Card className="bg-slate-900/60 border-slate-800">
+                        <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Max Window Drawdown</div>
+                        <div className="text-2xl font-mono text-red-400">-{currentStats.strategy.maxDD.toFixed(1)}%</div>
+                    </Card>
+                    <Card className="bg-slate-900/60 border-slate-800">
+                        <div className="text-[10px] text-slate-500 uppercase font-bold tracking-wider mb-1">Sharpe Ratio</div>
+                        <div className="text-2xl font-mono text-indigo-400">{currentStats.strategy.sharpe.toFixed(2)}</div>
+                    </Card>
                </div>
 
                <div className="flex flex-col xl:flex-row justify-between items-center gap-6">
@@ -196,8 +282,8 @@ export const BacktestEngine = () => {
 
                     <div className="flex-1 w-full bg-slate-900 p-4 rounded-xl border border-slate-800 space-y-3">
                         <div className="flex justify-between text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                            <span>Analysis Start: <span className="text-white font-mono">{filteredSeries[0]?.date}</span></span>
-                            <span>Analysis End: <span className="text-white font-mono">{filteredSeries[filteredSeries.length-1]?.date}</span></span>
+                            <span>Slicer Start: <span className="text-white font-mono">{filteredSeries[0]?.date}</span></span>
+                            <span>Slicer End: <span className="text-white font-mono">{filteredSeries[filteredSeries.length-1]?.date}</span></span>
                         </div>
                         <div className="relative h-6 flex items-center px-2">
                             <input 
@@ -226,16 +312,17 @@ export const BacktestEngine = () => {
                             />
                         </div>
                         <div className="text-[9px] text-center text-slate-600 font-mono italic">
-                            Grab either handle to slice. Performance re-baselines to 10k at your chosen start.
+                            Adjust either handle to slice. Performance re-baselines to 10k at your chosen start.
                         </div>
                     </div>
                </div>
 
                {activeTab === 'Chart' && (
                    <div className="space-y-6">
-                       <Card className="h-[450px] flex flex-col p-8">
+                       <Card className="h-[450px] flex flex-col p-8 bg-slate-900/40 border-slate-800 shadow-xl">
                             <div className="flex justify-between items-center mb-8">
                                 <h3 className="text-sm font-medium text-slate-400 uppercase tracking-widest">Growth Comparison (Indexed @ 10,000)</h3>
+                                <div className="text-[10px] text-slate-500 uppercase font-mono tracking-tighter">Window Points: {filteredSeries.length}</div>
                             </div>
                             <div className="flex-1 min-h-0">
                                 <ResponsiveContainer width="100%" height="100%">
@@ -252,7 +339,7 @@ export const BacktestEngine = () => {
                             </div>
                        </Card>
 
-                       <Card className="h-[250px] flex flex-col p-8">
+                       <Card className="h-[250px] flex flex-col p-8 bg-slate-900/40 border-slate-800 shadow-xl">
                             <div className="flex justify-between items-center mb-4">
                                 <h3 className="text-xs font-medium text-slate-400 uppercase tracking-widest">Regime Allocation (%)</h3>
                             </div>
@@ -274,9 +361,9 @@ export const BacktestEngine = () => {
                )}
 
                {activeTab === 'Compare' && (
-                   <div className="space-y-6">
-                       <Card className="p-0 overflow-hidden border-slate-800">
-                           <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Yearly Performance Matrix</div>
+                   <div className="space-y-6 animate-in fade-in duration-300">
+                       <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
+                           <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Window Performance Matrix</div>
                            <table className="w-full text-left text-xs font-mono">
                                <thead className="bg-slate-900/50 text-slate-400">
                                    <tr>
@@ -300,8 +387,8 @@ export const BacktestEngine = () => {
                        </Card>
 
                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                            <Card className="p-0 overflow-hidden border-slate-800">
-                                <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Rolling CAGR Comparison</div>
+                            <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
+                                <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Rolling CAGR Comparison (Window Basis)</div>
                                 <table className="w-full text-left text-xs font-mono">
                                     <thead className="bg-slate-900/50 text-slate-400">
                                         <tr>
@@ -326,8 +413,8 @@ export const BacktestEngine = () => {
                                 </table>
                             </Card>
 
-                            <Card className="p-0 overflow-hidden border-slate-800">
-                                <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Efficiency & Risk Profile</div>
+                            <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
+                                <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Window Risk Profile</div>
                                 <table className="w-full text-left text-xs font-mono">
                                     <thead className="bg-slate-900/50 text-slate-400">
                                         <tr><th className="px-6 py-3">Metric</th><th className="px-6 py-3 text-emerald-400">Strategy</th><th className="px-6 py-3 text-slate-200 font-bold">Benchmark</th></tr>
@@ -340,29 +427,11 @@ export const BacktestEngine = () => {
                                 </table>
                             </Card>
                        </div>
-
-                       <Card className="p-0 overflow-hidden border-slate-800">
-                            <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Yearly Activity & Implementation</div>
-                            <table className="w-full text-left text-xs font-mono">
-                                <thead className="bg-slate-900/50 text-slate-400">
-                                    <tr><th className="px-6 py-3">Year</th><th className="px-6 py-3 text-center">Regime Switches</th><th className="px-6 py-3 text-right">Execution Frequency (Trades)</th></tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-800">
-                                    {currentStats.yearlyActivity.map(y => (
-                                        <tr key={y.year} className="hover:bg-slate-800/30 transition-colors">
-                                            <td className="px-6 py-4 font-bold text-slate-300">{y.year}</td>
-                                            <td className="px-6 py-4 text-center text-amber-500 font-bold">{y.switches}</td>
-                                            <td className="px-6 py-4 text-right text-indigo-400">{y.totalTrades}</td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                       </Card>
                    </div>
                )}
 
                {activeTab === 'Trades' && detailedResult && (
-                   <Card className="p-0 overflow-hidden border-slate-800 shadow-2xl">
+                   <Card className="p-0 overflow-hidden border-slate-800 shadow-2xl bg-slate-900/40">
                        <div className="overflow-x-auto">
                            <table className="w-full text-left text-xs font-mono">
                                <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
