@@ -11,6 +11,16 @@ export const AVAILABLE_RULES: Rule[] = [
     id: 'rule_2',
     name: 'Triple Trend Quick Response',
     description: '25% weight to 25d MA, 50% weight to 50d MA, and 25% weight to 100d MA. Faster, more aggressive response to trend shifts.'
+  },
+  {
+    id: 'rule_3',
+    name: 'Macro-Vol Adaptive Trend (Alpha)',
+    description: '50% 200d MA (Macro), 30% 50d MA (Medium), and 20% Volatility Guard. Reduces exposure when volatility expands even if price is high.'
+  },
+  {
+    id: 'rule_4',
+    name: 'Multi-Timeframe Sentinel (Alpha+)',
+    description: '40% 200d MA, 30% 126d Momentum, 30% 63d Momentum. Includes a Volatility-Clamp that halves exposure if short-term risk spikes.'
   }
 ];
 
@@ -41,15 +51,48 @@ export const INITIAL_STRATEGIES: Strategy[] = [
     slippagePct: 0.1,
     benchmarkSymbolId: '2', // QQQ
     backtestDuration: '5Y',
-    riskOnComponents: [
-      { symbolId: '2', direction: 'Long', allocation: 100 } // QQQ
-    ],
+    riskOnComponents: [{ symbolId: '2', direction: 'Long', allocation: 100 }],
+    riskOffComponents: [{ symbolId: '3', direction: 'Long', allocation: 100 }],
+    rules: [{ ruleId: 'rule_2', weight: 100 }],
+    subStrategyAllocations: []
+  },
+  {
+    id: 'strat_sentinel_nifty',
+    name: 'NIFTY Sentinel Alpha+',
+    type: 'Single',
+    description: 'High-performance strategy using Multi-Timeframe Sentinel logic. Switches between Nifty and Gold/Bonds with volatility protection.',
+    rebalanceFreq: RebalanceFrequency.WEEKLY,
+    pricePreference: PriceType.AVG,
+    executionDelay: 1,
+    initialCapital: 10000,
+    transactionCostPct: 0.05,
+    slippagePct: 0.05,
+    benchmarkSymbolId: '9', // NIFTYBEES
+    backtestDuration: '10Y',
+    riskOnComponents: [{ symbolId: '9', direction: 'Long', allocation: 100 }],
     riskOffComponents: [
-      { symbolId: '3', direction: 'Long', allocation: 100 } // TLT
+        { symbolId: '7', direction: 'Long', allocation: 50 }, // Gold
+        { symbolId: '10', direction: 'Long', allocation: 50 } // Bond
     ],
-    rules: [
-      { ruleId: 'rule_2', weight: 100 }
-    ],
+    rules: [{ ruleId: 'rule_4', weight: 100 }],
+    subStrategyAllocations: []
+  },
+  {
+    id: 'strat_alpha_vol_nifty',
+    name: 'NIFTY Alpha-Vol (Rule 3)',
+    type: 'Single',
+    description: 'Uses Macro-Vol Adaptive Trend to navigate NiftyBees. 50% 200d MA, 30% 50d MA, 20% Vol Guard.',
+    rebalanceFreq: RebalanceFrequency.WEEKLY,
+    pricePreference: PriceType.AVG,
+    executionDelay: 1,
+    initialCapital: 10000,
+    transactionCostPct: 0.1,
+    slippagePct: 0.1,
+    benchmarkSymbolId: '9', // NIFTYBEES
+    backtestDuration: '10Y',
+    riskOnComponents: [{ symbolId: '9', direction: 'Long', allocation: 100 }],
+    riskOffComponents: [{ symbolId: '10', direction: 'Long', allocation: 100 }], // Bond
+    rules: [{ ruleId: 'rule_3', weight: 100 }],
     subStrategyAllocations: []
   },
   {
@@ -67,6 +110,24 @@ export const INITIAL_STRATEGIES: Strategy[] = [
     backtestDuration: '5Y',
     riskOnComponents: [{ symbolId: '6', direction: 'Long', allocation: 100 }],
     riskOffComponents: [{ symbolId: '7', direction: 'Long', allocation: 100 }],
+    rules: [{ ruleId: 'rule_2', weight: 100 }],
+    subStrategyAllocations: []
+  },
+  {
+    id: 'strat_silver_nifty',
+    name: 'SILVERBEES NIFTY',
+    type: 'Single',
+    description: 'Switching between Silver and Nifty based on Triple Trend Fast response.',
+    rebalanceFreq: RebalanceFrequency.WEEKLY,
+    pricePreference: PriceType.AVG,
+    executionDelay: 1,
+    initialCapital: 10000,
+    transactionCostPct: 0.1,
+    slippagePct: 0.1,
+    benchmarkSymbolId: '6', // SILVERBEES
+    backtestDuration: '5Y',
+    riskOnComponents: [{ symbolId: '6', direction: 'Long', allocation: 100 }],
+    riskOffComponents: [{ symbolId: '9', direction: 'Long', allocation: 100 }],
     rules: [{ ruleId: 'rule_2', weight: 100 }],
     subStrategyAllocations: []
   },
