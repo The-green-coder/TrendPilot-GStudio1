@@ -25,7 +25,8 @@ export const StrategyBuilder = () => {
     benchmarkSymbolId: '',
     riskOnComponents: [],
     riskOffComponents: [],
-    rules: []
+    rules: [],
+    onlyTradeOnSignalChange: false
   });
 
   useEffect(() => {
@@ -64,7 +65,6 @@ export const StrategyBuilder = () => {
 
   const assetOptions = useMemo(() => {
     const opts = symbols.map(s => ({ value: s.id, label: `(SYM) ${s.ticker} - ${s.name}` }));
-    // Filter out current strategy from its own sub-options to prevent infinite recursion
     const filteredStrats = strategies.filter(s => s.id !== form.id);
     const stratOpts = filteredStrats.map(s => ({ value: `STRAT:${s.id}`, label: `(STRAT) ${s.name}` }));
     return [...opts, ...stratOpts];
@@ -123,7 +123,8 @@ export const StrategyBuilder = () => {
       riskOnComponents: form.riskOnComponents || [],
       riskOffComponents: form.riskOffComponents || [],
       rules: form.rules || [],
-      subStrategyAllocations: form.subStrategyAllocations || []
+      subStrategyAllocations: form.subStrategyAllocations || [],
+      onlyTradeOnSignalChange: !!form.onlyTradeOnSignalChange
     };
     StorageService.saveStrategy(newStrategy);
     loadStrategies();
@@ -165,16 +166,6 @@ export const StrategyBuilder = () => {
                     </span>
                     {isError && sum > 0 && <button onClick={() => normalizeWeights(type)} className="text-[9px] text-emerald-400 hover:underline ml-2">Fix to 100%</button>}
                 </div>
-                <div className="group relative">
-                  <svg className="w-4 h-4 text-slate-500 cursor-help" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                  <div className="absolute right-0 bottom-full mb-2 w-72 p-3 bg-slate-800 text-[11px] text-slate-300 rounded-lg shadow-2xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 border border-slate-700 leading-relaxed">
-                    <p className="font-bold text-emerald-400 mb-1">Basket Weighting Logic:</p>
-                    Final Asset Weight = (Asset % / Sum of Basket %) × Current Regime Multiplier.<br/>
-                    Example: If Signal is 50% Risk-On, and this asset is 20% of a 100% basket, it gets 10% total NAV allocation.
-                  </div>
-                </div>
                 <Button variant="ghost" className="text-[10px] h-7 px-2 border border-slate-800" onClick={() => addComponent(type)}>+ ADD</Button>
             </div>
             {components?.map((comp, idx) => (
@@ -194,7 +185,7 @@ export const StrategyBuilder = () => {
                           onChange={(e) => updateComponent(type, idx, 'allocation', Number(e.target.value))} 
                         />
                         <span className="absolute right-12 top-2 text-[10px] text-slate-500 font-bold">%</span>
-                        <button onClick={() => removeComponent(type, idx)} className="text-slate-600 hover:text-red-400 p-1 transition-colors" title="Remove Asset">
+                        <button onClick={() => removeComponent(type, idx)} className="text-slate-600 hover:text-red-400 p-1 transition-colors">
                           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                           </svg>
@@ -247,10 +238,23 @@ export const StrategyBuilder = () => {
                     </section>
 
                     <section className="space-y-4">
-                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-2">Rebalance & Logic</h3>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                             <Select label="Rebalance Frequency" value={form.rebalanceFreq || RebalanceFrequency.WEEKLY} onChange={e => setForm({...form, rebalanceFreq: e.target.value as RebalanceFrequency})} options={Object.values(RebalanceFrequency).map(v => ({ value: v, label: v }))} />
-                            <Select label="Regime Switch Rule" value={form.rules?.[0]?.ruleId || ''} onChange={e => setForm({...form, rules: [{ ruleId: e.target.value, weight: 100 }]})} options={AVAILABLE_RULES.map(r => ({ value: r.id, label: r.name }))} />
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-2">Trading Behavior</h3>
+                        <div className="flex items-center gap-6">
+                             <div className="flex-1">
+                                <Select label="Rebalance Frequency" value={form.rebalanceFreq || RebalanceFrequency.WEEKLY} onChange={e => setForm({...form, rebalanceFreq: e.target.value as RebalanceFrequency})} options={Object.values(RebalanceFrequency).map(v => ({ value: v, label: v }))} />
+                             </div>
+                             <div className="flex-1">
+                                <label className="block text-sm font-medium text-slate-400 mb-1.5">Trade Filter</label>
+                                <div className="flex items-center gap-2 h-10 px-3 bg-slate-950 border border-slate-700 rounded-lg">
+                                    <input 
+                                        type="checkbox" 
+                                        checked={!!form.onlyTradeOnSignalChange} 
+                                        onChange={e => setForm({...form, onlyTradeOnSignalChange: e.target.checked})}
+                                        className="w-4 h-4 rounded bg-slate-800 border-slate-600 text-emerald-500 focus:ring-emerald-500"
+                                    />
+                                    <span className="text-xs text-slate-300 font-medium uppercase tracking-tighter">Signal-Only Trading</span>
+                                </div>
+                             </div>
                         </div>
                     </section>
                 </Card>
@@ -272,11 +276,9 @@ export const StrategyBuilder = () => {
                     <div className="space-y-4 text-xs">
                         <div className="flex justify-between"><span className="text-slate-500">Capital:</span><span className="text-slate-200 font-mono">${form.initialCapital?.toLocaleString()}</span></div>
                         <div className="flex justify-between"><span className="text-slate-500">Rebalance:</span><span className="text-slate-200">{form.rebalanceFreq}</span></div>
-                        <div className="flex justify-between"><span className="text-slate-500">Rule:</span><span className="text-slate-200 font-medium">{AVAILABLE_RULES.find(r => r.id === form.rules?.[0]?.ruleId)?.name || 'None'}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">Signal-Only:</span><span className={form.onlyTradeOnSignalChange ? 'text-emerald-400' : 'text-slate-500'}>{form.onlyTradeOnSignalChange ? 'Enabled' : 'Disabled'}</span></div>
                         <div className="pt-4 border-t border-slate-800">
-                            <div className="text-[9px] text-slate-600 font-bold mb-2 uppercase italic leading-relaxed">
-                                {AVAILABLE_RULES.find(r => r.id === form.rules?.[0]?.ruleId)?.description || 'No rule selected.'}
-                            </div>
+                             <Select label="Regime Switch Rule" value={form.rules?.[0]?.ruleId || ''} onChange={e => setForm({...form, rules: [{ ruleId: e.target.value, weight: 100 }]})} options={AVAILABLE_RULES.map(r => ({ value: r.id, label: r.name }))} />
                         </div>
                     </div>
                 </Card>
@@ -290,7 +292,7 @@ export const StrategyBuilder = () => {
     <div className="space-y-6">
       <div className="flex justify-between items-center">
         <div><h2 className="text-2xl font-bold text-white tracking-tight">Strategy Manager</h2><p className="text-slate-400 text-sm">Design meta-strategies by combining assets and other strategies.</p></div>
-        <Button onClick={() => { setForm({ riskOnComponents: [], riskOffComponents: [], rules: [] }); setView('EDITOR'); }}>+ New Strategy</Button>
+        <Button onClick={() => { setForm({ riskOnComponents: [], riskOffComponents: [], rules: [], onlyTradeOnSignalChange: false }); setView('EDITOR'); }}>+ New Strategy</Button>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {strategies.map(strat => (
@@ -303,6 +305,7 @@ export const StrategyBuilder = () => {
                     <div className="grid grid-cols-2 gap-y-1 text-[11px] text-slate-500 mb-4">
                         <div>Risk-On Assets</div><div className="text-slate-200 text-right">{strat.riskOnComponents.length}</div>
                         <div>Risk-Off Assets</div><div className="text-slate-200 text-right">{strat.riskOffComponents.length}</div>
+                        <div>Signal-Only</div><div className="text-slate-200 text-right">{strat.onlyTradeOnSignalChange ? 'YES' : 'NO'}</div>
                     </div>
                   </div>
                   <div className="mt-4 pt-4 border-t border-slate-800 flex gap-2">

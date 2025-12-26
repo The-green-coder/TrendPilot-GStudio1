@@ -106,7 +106,6 @@ export const StrategyEngine = {
             const idx = sortedDates.indexOf(date);
             if (idx === -1) return null;
             
-            // Refinement: If history is shorter than period, use what we have to prevent zero-signal start
             const actualLookback = Math.min(idx, period);
             if (actualLookback < 5) return null; 
 
@@ -161,6 +160,7 @@ export const StrategyEngine = {
         let trades: SimTrade[] = [];
         let regimeSwitches: { date: string, from: number, to: number }[] = [];
         let lastLoggedRegime = -1;
+        let lastExecutedSignal = -1; // New tracker for Signal-Only mode
         let targetWeights: Record<string, number> = {};
         let pendingRebalanceDay: number | null = null;
         const bmStart = getSafePrice(benchmarkTicker, simDates[0]);
@@ -213,12 +213,19 @@ export const StrategyEngine = {
 
             // C. Rebalancing Trigger
             if (isRebalanceDay(date, i, strategy.rebalanceFreq)) {
-                const newTargets: Record<string, number> = {};
-                strategy.riskOnComponents.forEach(c => newTargets[resolveTicker(c.symbolId)] = (newTargets[resolveTicker(c.symbolId)] || 0) + (riskOnW * (c.allocation / 100)));
-                strategy.riskOffComponents.forEach(c => newTargets[resolveTicker(c.symbolId)] = (newTargets[resolveTicker(c.symbolId)] || 0) + ((1 - riskOnW) * (c.allocation / 100)));
-                targetWeights = newTargets;
-                if (pendingRebalanceDay === null) {
-                    pendingRebalanceDay = i + (strategy.executionDelay || 0);
+                // If Signal-Only mode is enabled, only proceed if the riskOnW has changed from the last rebalance
+                const signalChanged = Math.abs(riskOnW - lastExecutedSignal) > 0.01;
+                
+                if (!strategy.onlyTradeOnSignalChange || signalChanged || i === 0) {
+                    const newTargets: Record<string, number> = {};
+                    strategy.riskOnComponents.forEach(c => newTargets[resolveTicker(c.symbolId)] = (newTargets[resolveTicker(c.symbolId)] || 0) + (riskOnW * (c.allocation / 100)));
+                    strategy.riskOffComponents.forEach(c => newTargets[resolveTicker(c.symbolId)] = (newTargets[resolveTicker(c.symbolId)] || 0) + ((1 - riskOnW) * (c.allocation / 100)));
+                    targetWeights = newTargets;
+                    lastExecutedSignal = riskOnW; // Update for future checks
+                    
+                    if (pendingRebalanceDay === null) {
+                        pendingRebalanceDay = i + (strategy.executionDelay || 0);
+                    }
                 }
             }
 

@@ -82,6 +82,7 @@ export interface Strategy {
   slippagePct: number;
   benchmarkSymbolId: string;
   backtestDuration: string; // e.g., '1Y', '3M'
+  onlyTradeOnSignalChange?: boolean; // New: Only trade when MA/Logic triggers a weight shift
 
   // Logic
   riskOnComponents: StrategyComponent[];

@@ -53,58 +53,65 @@ const PROXIES: ProxyStrategy[] = [
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /**
- * Advanced Market Data Sanitization
- * Specifically engineered to handle "near-zero" drops and "fat-finger" spikes 
- * common in Yahoo Finance and NSE data feeds.
+ * Advanced Market Data Sanitization - Final Tier
+ * Handles "Garbage Head" data, Zero-Drops, and extreme volatility spikes.
  */
 const cleanData = (data: MarketDataPoint[]): MarketDataPoint[] => {
-    if (data.length < 5) return data;
+    if (data.length < 10) return data;
 
     // 1. Initial Sort and Basic Zero Removal
     let sorted = [...data]
         .sort((a, b) => a.date.localeCompare(b.date))
-        .filter(d => d.close > 0 && !isNaN(d.close));
+        .filter(d => d.close > 0.001 && !isNaN(d.close));
+
+    if (sorted.length < 10) return sorted;
 
     const getMedian = (values: number[]) => {
-        const sortedVals = [...values].sort((a, b) => a - b);
-        const mid = Math.floor(sortedVals.length / 2);
-        return sortedVals.length % 2 !== 0 ? sortedVals[mid] : (sortedVals[mid - 1] + sortedVals[mid]) / 2;
+        const v = [...values].sort((a, b) => a - b);
+        const mid = Math.floor(v.length / 2);
+        return v.length % 2 !== 0 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
     };
 
     /**
-     * PASS 1: Rolling Median Baseline
-     * We use a 5-day rolling median to define "Fair Value". 
-     * If a price deviates from this median by > 25% for an ETF/Index, it's flagged.
+     * PASS 0: Garbage-Head Trim
+     * Often free data starts with prices like 0.01 before suddenly jumping to 100.
+     * We detect if the first 5% of data is >10x different from the overall median.
+     */
+    const overallMedian = getMedian(sorted.map(d => d.close));
+    let startIdx = 0;
+    for (let i = 0; i < Math.min(sorted.length, 50); i++) {
+        // If price is less than 5% of overall median, it's likely pre-split garbage or bad history
+        if (sorted[i].close < overallMedian * 0.05) {
+            startIdx = i + 1;
+        } else {
+            break;
+        }
+    }
+    if (startIdx > 0) sorted = sorted.slice(startIdx);
+
+    /**
+     * PASS 1: Rolling Median & Outlier Correction
      */
     const pass1: MarketDataPoint[] = [];
     for (let i = 0; i < sorted.length; i++) {
         const curr = { ...sorted[i] };
-        
-        // Window of 5 days (2 before, 2 after if available)
         const windowIdxs = [i-2, i-1, i, i+1, i+2].filter(idx => idx >= 0 && idx < sorted.length);
         const windowPrices = windowIdxs.map(idx => sorted[idx].close);
         const medianPrice = getMedian(windowPrices);
 
-        // Threshold: 25% deviation from median is extremely unlikely for indices/ETFs 
-        // without a global circuit breaker, and usually indicates a glitch.
         const deviation = Math.abs(curr.close - medianPrice) / medianPrice;
         
         if (deviation > 0.25) {
-            // Check if it's a "V" shape (temporary glitch) vs a structural move
-            // If the next day stays at this new price, it might be a split or real move.
-            // If it reverts back towards the median, it's a glitch.
             const next = sorted[i+1];
             if (next) {
                 const nextDeviation = Math.abs(next.close - medianPrice) / medianPrice;
                 if (nextDeviation < 0.15) {
-                    // It's a single day glitch - heal it using median
                     curr.close = medianPrice;
                     curr.open = medianPrice;
                     curr.high = medianPrice;
                     curr.low = medianPrice;
                 }
             } else {
-                // End of series glitch
                 curr.close = medianPrice;
                 curr.open = medianPrice;
             }
@@ -113,22 +120,19 @@ const cleanData = (data: MarketDataPoint[]): MarketDataPoint[] => {
     }
 
     /**
-     * PASS 2: Progressive Mean-Reversion Healing
-     * Catching drops that might last 2 days (sometimes seen in Indian ETFs data gaps).
+     * PASS 2: Progressive Mean-Reversion & Stability
      */
     const cleaned: MarketDataPoint[] = [];
     for (let i = 0; i < pass1.length; i++) {
         const curr = { ...pass1[i] };
         const prev = cleaned.length > 0 ? cleaned[cleaned.length - 1] : null;
         
-        // Absolute sanity check: Indices/ETFs should not drop 70%+ in a window unless it's a split
-        // Splits should be handled by the source, but if not, we heal it to prevent -90% drawdowns.
         if (prev) {
             const dropRatio = curr.close / prev.close;
-            if (dropRatio < 0.3) { // 70% drop
-                // Look ahead 3 days - does it recover?
+            // Catch catastrophic drops (>85%) that immediately recover
+            if (dropRatio < 0.15) {
                 let recovered = false;
-                for (let j = 1; j <= 3; j++) {
+                for (let j = 1; j <= 4; j++) {
                     const future = pass1[i + j];
                     if (future && (future.close / prev.close) > 0.8) {
                         recovered = true;
@@ -148,8 +152,8 @@ const cleanData = (data: MarketDataPoint[]): MarketDataPoint[] => {
         // Final High/Low clamping
         const bodyMax = Math.max(curr.open, curr.close);
         const bodyMin = Math.min(curr.open, curr.close);
-        if (curr.high > bodyMax * 1.2) curr.high = bodyMax * 1.02;
-        if (curr.low < bodyMin * 0.8) curr.low = bodyMin * 0.98;
+        if (curr.high > bodyMax * 1.25) curr.high = bodyMax * 1.05;
+        if (curr.low < bodyMin * 0.75) curr.low = bodyMin * 0.95;
         if (curr.high < bodyMax) curr.high = bodyMax;
         if (curr.low > bodyMin) curr.low = bodyMin;
 

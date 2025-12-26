@@ -15,7 +15,7 @@ interface ComparisonStats {
   rolling: { tenor: string; strat: { min: number; mean: number; max: number }; bench: { min: number; mean: number; max: number } }[];
   yearlyActivity: { year: number; switches: number; totalTrades: number }[];
   yearlyReturns: { year: number; strat: number; bench: number }[];
-  tenors: { tenor: string; strat: number | string; bench: number | string }[];
+  tenors: { label: string; stats: { strat: number; bench: number; alpha: number } }[];
 }
 
 export const BacktestEngine = () => {
@@ -23,8 +23,8 @@ export const BacktestEngine = () => {
   const [symbols, setSymbols] = useState<SymbolData[]>([]);
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
   const [selectedDuration, setSelectedDuration] = useState<string>('1Y');
+  const [onlyTradeOnSignalChange, setOnlyTradeOnSignalChange] = useState(false);
   
-  // Custom date range state
   const [customStartDate, setCustomStartDate] = useState<string>(new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0]);
   const [customEndDate, setCustomEndDate] = useState<string>(new Date().toISOString().split('T')[0]);
 
@@ -46,40 +46,68 @@ export const BacktestEngine = () => {
     if (s.length > 0 && !selectedStrategyId) {
       setSelectedStrategyId(s[0].id);
       setSelectedDuration(s[0].backtestDuration || '1Y');
+      setOnlyTradeOnSignalChange(s[0].onlyTradeOnSignalChange || false);
     }
   };
 
+  useEffect(() => {
+    const s = strategies.find(strat => strat.id === selectedStrategyId);
+    if (s) setOnlyTradeOnSignalChange(s.onlyTradeOnSignalChange || false);
+  }, [selectedStrategyId, strategies]);
+
   const calculateFullStats = (slice: SimResultPoint[], trades: SimTrade[], switches: any[]): ComparisonStats => {
     const calcBase = (vals: number[]) => {
-      if (vals.length < 2) return { totalReturn: 0, cagr: 0, maxDD: 0, volatility: 0, sharpe: 0 };
-      const returns = [];
+      if (vals.length < 5) return { totalReturn: 0, cagr: 0, maxDD: 0, volatility: 0, sharpe: 0 };
+      
+      const returns: number[] = [];
       for (let i = 1; i < vals.length; i++) {
-        const r = (vals[i] / (vals[i - 1] || 1)) - 1;
-        returns.push(isNaN(r) || !isFinite(r) ? 0 : r);
+        let r = (vals[i] / (vals[i - 1] || 1)) - 1;
+        if (r > 1) r = 1;
+        if (r < -0.9) r = -0.9;
+        if (isFinite(r)) returns.push(r);
       }
+      
       const first = vals[0], last = vals[vals.length - 1];
       const years = Math.max(0.01, vals.length / 252);
-      const cagr = (Math.pow(Math.abs(last / (first || 1)), 1 / years) - 1) * 100;
-      const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-      const vol = Math.sqrt(returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (returns.length - 1) * 252) * 100;
+      
+      let cagr = (Math.pow(Math.abs(last / (first || 1)), 1 / years) - 1) * 100;
+      if (!isFinite(cagr) || cagr > 10000) cagr = 0;
+
+      const mean = returns.length > 0 ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
+      const vol = returns.length > 1 
+        ? Math.sqrt(returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (returns.length - 1) * 252) * 100
+        : 0;
+
       let peak = -Infinity, mdd = 0;
       vals.forEach(v => { if (v > peak) peak = v; const dd = (peak - v) / (peak || 1); if (dd > mdd) mdd = dd; });
-      return { totalReturn: ((last - first) / (first || 1)) * 100, cagr, maxDD: mdd * 100, volatility: vol, sharpe: vol > 0 ? (cagr - 5) / vol : 0 }; 
+      
+      return { 
+        totalReturn: ((last - first) / (first || 1)) * 100, 
+        cagr, 
+        maxDD: mdd * 100, 
+        volatility: vol, 
+        sharpe: (vol > 1) ? (cagr - 5) / vol : 0 
+      }; 
     };
 
     const calcRolling = (series: number[], window: number) => {
-      if (series.length < window) return { min: 0, mean: 0, max: 0 };
-      const rolls = [];
+      if (series.length < window + 5) return { min: 0, mean: 0, max: 0 };
+      const rolls: number[] = [];
       const years = window / 252;
       for (let i = window; i < series.length; i++) {
-        const ret = (Math.pow(Math.abs(series[i] / (series[i - window] || 1)), 1 / years) - 1) * 100;
-        if (!isNaN(ret) && isFinite(ret)) rolls.push(ret);
+        const start = series[i - window];
+        const end = series[i];
+        if (start < 0.01) continue;
+        const ret = (Math.pow(Math.abs(end / start), 1 / years) - 1) * 100;
+        if (isFinite(ret) && Math.abs(ret) < 2000) {
+            rolls.push(ret);
+        }
       }
       if (rolls.length === 0) return { min: 0, mean: 0, max: 0 };
       return {
         min: Math.min(...rolls),
         max: Math.max(...rolls),
-        mean: rolls.reduce((a, b) => a + b, 0) / (rolls.length || 1)
+        mean: rolls.reduce((a, b) => a + b, 0) / rolls.length
       };
     };
 
@@ -93,10 +121,14 @@ export const BacktestEngine = () => {
     
     const yearlyReturns = yearsList.map(yr => {
         const yrData = slice.filter(p => new Date(p.date).getFullYear() === yr);
-        if (yrData.length < 2) return { year: yr, strat: 0, bench: 0 };
+        if (yrData.length < 10) return { year: yr, strat: 0, bench: 0 };
         const stratRet = ((yrData[yrData.length-1].value / yrData[0].value) - 1) * 100;
         const benchRet = ((yrData[yrData.length-1].benchmarkValue / yrData[0].benchmarkValue) - 1) * 100;
-        return { year: yr, strat: stratRet, bench: benchRet };
+        return { 
+            year: yr, 
+            strat: isFinite(stratRet) ? stratRet : 0, 
+            bench: isFinite(benchRet) ? benchRet : 0 
+        };
     });
 
     const yearlyActivity = yearsList.map(yr => {
@@ -105,23 +137,40 @@ export const BacktestEngine = () => {
         return { year: yr, switches: yrSwitches.length, totalTrades: yrTrades.length };
     });
 
-    const getTenorCAGR = (s: SimResultPoint[], days: number) => {
-        if (s.length < days) return 'N/A';
+    const getTenorStats = (s: SimResultPoint[], days: number) => {
+        if (s.length < days + 5) return null;
         const subset = s.slice(-days);
+        const start = subset[0].value;
+        const end = subset[subset.length-1].value;
+        const bStart = subset[0].benchmarkValue;
+        const bEnd = subset[subset.length-1].benchmarkValue;
+        
+        if (start < 0.1 || bStart < 0.1) return null;
+        
         const years = days / 252;
-        const res = (Math.pow(Math.abs(subset[subset.length-1].value / (subset[0].value || 1)), 1/years) - 1) * 100;
-        return res.toFixed(2) + '%';
+        const sCAGR = (Math.pow(Math.abs(end / start), 1/years) - 1) * 100;
+        const bCAGR = (Math.pow(Math.abs(bEnd / bStart), 1/years) - 1) * 100;
+        
+        return {
+            strat: sCAGR,
+            bench: bCAGR,
+            alpha: sCAGR - bCAGR
+        };
     };
 
+    const stratStats = calcBase(slice.map(p=>p.value));
+    const benchStats = calcBase(slice.map(p=>p.benchmarkValue));
+
     const tenors = [
-        { tenor: '1 Year CAGR', strat: getTenorCAGR(slice, 252), bench: getTenorCAGR(slice.map(p=>({ ...p, value: p.benchmarkValue })), 252) },
-        { tenor: '3 Year CAGR', strat: getTenorCAGR(slice, 756), bench: getTenorCAGR(slice.map(p=>({ ...p, value: p.benchmarkValue })), 756) },
-        { tenor: 'Full Period CAGR', strat: calcBase(slice.map(p=>p.value)).cagr.toFixed(2) + '%', bench: calcBase(slice.map(p=>p.benchmarkValue)).cagr.toFixed(2) + '%' }
-    ];
+        { label: '1 Year', stats: getTenorStats(slice, 252) },
+        { label: '3 Years', stats: getTenorStats(slice, 756) },
+        { label: '5 Years', stats: getTenorStats(slice, 1260) },
+        { label: 'Full Period', stats: { strat: stratStats.cagr, bench: benchStats.cagr, alpha: stratStats.cagr - benchStats.cagr } }
+    ].filter(t => t.stats !== null) as { label: string; stats: { strat: number; bench: number; alpha: number } }[];
 
     return { 
-      strategy: calcBase(slice.map(p => p.value)), 
-      benchmark: calcBase(slice.map(p => p.benchmarkValue)),
+      strategy: stratStats, 
+      benchmark: benchStats,
       rolling,
       yearlyActivity,
       yearlyReturns,
@@ -136,7 +185,9 @@ export const BacktestEngine = () => {
         const strat = strategies.find(s => s.id === selectedStrategyId);
         if (!strat) throw new Error("Select a strategy");
 
-        // Calculate Start/End Date based on Selected Duration
+        // Temporary override for simulation
+        const runConfig = { ...strat, onlyTradeOnSignalChange };
+
         let startDate: string | undefined = undefined;
         let endDate: string | undefined = undefined;
 
@@ -153,7 +204,7 @@ export const BacktestEngine = () => {
             endDate = new Date().toISOString().split('T')[0];
         }
 
-        const sim = await StrategyEngine.runSimulation(strat, symbols, startDate, endDate);
+        const sim = await StrategyEngine.runSimulation(runConfig, symbols, startDate, endDate);
         setDetailedResult({ trades: sim.trades, regimeSwitches: sim.regimeSwitches });
         setResult({
             strategyId: strat.id, runDate: new Date().toISOString(),
@@ -171,13 +222,25 @@ export const BacktestEngine = () => {
   const { filteredSeries, currentStats } = useMemo(() => {
     if (!result || range[1] <= range[0] || !detailedResult) return { filteredSeries: [], currentStats: null };
     const slice = result.navSeries.slice(range[0], range[1] + 1);
-    const stratStart = slice[0].value;
-    const bmStart = slice[0].benchmarkValue;
+    
+    let stratStart = 0;
+    let bmStart = 0;
+    for (let i = 0; i < Math.min(slice.length, 10); i++) {
+        if (slice[i].value > 1 && slice[i].benchmarkValue > 1) {
+            stratStart = slice[i].value;
+            bmStart = slice[i].benchmarkValue;
+            break;
+        }
+    }
+    if (!stratStart) stratStart = slice[0].value || 1;
+    if (!bmStart) bmStart = slice[0].benchmarkValue || 1;
+
     const normalized = slice.map(p => ({
       ...p,
-      value: (p.value / (stratStart || 1)) * 10000,
-      benchmarkValue: (p.benchmarkValue / (bmStart || 1)) * 10000
+      value: (p.value / stratStart) * 10000,
+      benchmarkValue: (p.benchmarkValue / bmStart) * 10000
     }));
+
     const stats = calculateFullStats(normalized, detailedResult.trades, detailedResult.regimeSwitches);
     return { filteredSeries: normalized, currentStats: stats };
   }, [result, range, detailedResult]);
@@ -195,7 +258,7 @@ export const BacktestEngine = () => {
        <div className="flex flex-col xl:flex-row justify-between items-end gap-4">
             <div className="w-full xl:w-auto">
                 <h2 className="text-2xl font-bold text-white tracking-tight">Backtesting Engine</h2>
-                <p className="text-slate-400 text-sm">Quant analysis with standard tenors and dynamic slicing.</p>
+                <p className="text-slate-400 text-sm">Quant analysis with robust error-filtering for historical data.</p>
             </div>
             <div className="flex flex-wrap gap-3 items-end bg-slate-900 p-4 rounded-xl border border-slate-800 shadow-2xl w-full xl:w-auto">
                 <Select 
@@ -225,26 +288,25 @@ export const BacktestEngine = () => {
                 
                 {selectedDuration === 'Custom' && (
                     <>
-                        <Input 
-                            type="date" 
-                            label="From" 
-                            value={customStartDate} 
-                            onChange={e => setCustomStartDate(e.target.value)} 
-                            className="w-full sm:w-36"
-                        />
-                        <Input 
-                            type="date" 
-                            label="To" 
-                            value={customEndDate} 
-                            onChange={e => setCustomEndDate(e.target.value)} 
-                            className="w-full sm:w-36"
-                        />
+                        <Input type="date" label="From" value={customStartDate} onChange={e => setCustomStartDate(e.target.value)} className="w-full sm:w-36" />
+                        <Input type="date" label="To" value={customEndDate} onChange={e => setCustomEndDate(e.target.value)} className="w-full sm:w-36" />
                     </>
                 )}
 
-                <Button onClick={runBacktest} disabled={isRunning} className="h-10 px-6 w-full sm:w-auto">
-                    {isRunning ? 'Simulating...' : 'Run Analysis'}
-                </Button>
+                <div className="flex flex-col gap-1">
+                    <label className="flex items-center gap-2 text-[10px] font-bold text-slate-500 uppercase cursor-pointer select-none px-1">
+                        <input 
+                            type="checkbox" 
+                            checked={onlyTradeOnSignalChange} 
+                            onChange={e => setOnlyTradeOnSignalChange(e.target.checked)}
+                            className="w-3 h-3 rounded bg-slate-950 border-slate-700 text-emerald-500"
+                        />
+                        Signal-Only Trading
+                    </label>
+                    <Button onClick={runBacktest} disabled={isRunning} className="h-10 px-6 w-full sm:w-auto text-sm">
+                        {isRunning ? 'Simulating...' : 'Run Analysis'}
+                    </Button>
+                </div>
             </div>
        </div>
 
@@ -286,34 +348,10 @@ export const BacktestEngine = () => {
                             <span>Slicer End: <span className="text-white font-mono">{filteredSeries[filteredSeries.length-1]?.date}</span></span>
                         </div>
                         <div className="relative h-6 flex items-center px-2">
-                            <input 
-                                type="range" 
-                                min={0} 
-                                max={result.navSeries.length - 1} 
-                                value={range[0]} 
-                                onChange={e => {
-                                    const val = Math.min(parseInt(e.target.value), range[1] - 1);
-                                    setRange([val, range[1]]);
-                                }} 
-                                className="dual-range-input absolute left-2 right-2 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500" 
-                                style={{ pointerEvents: 'auto', zIndex: range[0] > (result.navSeries.length / 2) ? 45 : 35 }}
-                            />
-                            <input 
-                                type="range" 
-                                min={0} 
-                                max={result.navSeries.length - 1} 
-                                value={range[1]} 
-                                onChange={e => {
-                                    const val = Math.max(parseInt(e.target.value), range[0] + 1);
-                                    setRange([range[0], val]);
-                                }} 
-                                className="dual-range-input absolute left-2 right-2 h-1.5 bg-transparent rounded-lg appearance-none cursor-pointer accent-indigo-500" 
-                                style={{ pointerEvents: 'auto', zIndex: range[1] < (result.navSeries.length / 2) ? 45 : 35 }}
-                            />
+                            <input type="range" min={0} max={result.navSeries.length - 1} value={range[0]} onChange={e => setRange([Math.min(parseInt(e.target.value), range[1]-1), range[1]])} className="dual-range-input absolute left-2 right-2 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500" style={{ pointerEvents: 'auto', zIndex: 40 }} />
+                            <input type="range" min={0} max={result.navSeries.length - 1} value={range[1]} onChange={e => setRange([range[0], Math.max(parseInt(e.target.value), range[0]+1)])} className="dual-range-input absolute left-2 right-2 h-1.5 bg-transparent rounded-lg appearance-none cursor-pointer accent-indigo-500" style={{ pointerEvents: 'auto', zIndex: 40 }} />
                         </div>
-                        <div className="text-[9px] text-center text-slate-600 font-mono italic">
-                            Adjust either handle to slice. Performance re-baselines to 10k at your chosen start.
-                        </div>
+                        <div className="text-[9px] text-center text-slate-600 font-mono italic uppercase tracking-tighter">Adjust handles to re-baseline chart to 10k at chosen start date.</div>
                     </div>
                </div>
 
@@ -340,9 +378,6 @@ export const BacktestEngine = () => {
                        </Card>
 
                        <Card className="h-[250px] flex flex-col p-8 bg-slate-900/40 border-slate-800 shadow-xl">
-                            <div className="flex justify-between items-center mb-4">
-                                <h3 className="text-xs font-medium text-slate-400 uppercase tracking-widest">Regime Allocation (%)</h3>
-                            </div>
                             <div className="flex-1 min-h-0">
                                 <ResponsiveContainer width="100%" height="100%">
                                     <AreaChart data={filteredSeries}>
@@ -362,62 +397,76 @@ export const BacktestEngine = () => {
 
                {activeTab === 'Compare' && (
                    <div className="space-y-6 animate-in fade-in duration-300">
-                       <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
-                           <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Window Performance Matrix</div>
-                           <table className="w-full text-left text-xs font-mono">
-                               <thead className="bg-slate-900/50 text-slate-400">
-                                   <tr>
-                                       <th className="px-6 py-3">Calendar Year</th>
-                                       <th className="px-6 py-3 text-emerald-400">Strategy Return</th>
-                                       <th className="px-6 py-3 text-slate-200 font-bold">Benchmark Return</th>
-                                       <th className="px-6 py-3">Alpha / Excess</th>
-                                   </tr>
-                               </thead>
-                               <tbody className="divide-y divide-slate-800">
-                                   {currentStats.yearlyReturns.map(yr => (
-                                       <tr key={yr.year} className="hover:bg-slate-800/30 transition-colors">
-                                           <td className="px-6 py-4 font-bold text-slate-300">{yr.year}</td>
-                                           <td className={`px-6 py-4 font-bold ${yr.strat >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{yr.strat.toFixed(2)}%</td>
-                                           <td className={`px-6 py-4 font-bold ${yr.bench >= 0 ? 'text-slate-200' : 'text-red-500'}`}>{yr.bench.toFixed(2)}%</td>
-                                           <td className={`px-6 py-4 font-bold ${yr.strat - yr.bench >= 0 ? 'text-indigo-400' : 'text-amber-600'}`}>{(yr.strat - yr.bench).toFixed(2)}%</td>
+                       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                           <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
+                               <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Window Performance Matrix</div>
+                               <table className="w-full text-left text-xs font-mono">
+                                   <thead className="bg-slate-900/50 text-slate-400">
+                                       <tr><th className="px-6 py-3">Year</th><th className="px-6 py-3 text-emerald-400">Strat</th><th className="px-6 py-3 text-slate-200">Bench</th><th className="px-6 py-3">Alpha</th></tr>
+                                   </thead>
+                                   <tbody className="divide-y divide-slate-800">
+                                       {currentStats.yearlyReturns.map(yr => (
+                                           <tr key={yr.year} className="hover:bg-slate-800/30">
+                                               <td className="px-6 py-4 font-bold text-slate-300">{yr.year}</td>
+                                               <td className={`px-6 py-4 font-bold ${yr.strat >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{yr.strat.toFixed(2)}%</td>
+                                               <td className={`px-6 py-4 font-bold ${yr.bench >= 0 ? 'text-slate-200' : 'text-red-500'}`}>{yr.bench.toFixed(2)}%</td>
+                                               <td className={`px-6 py-4 font-bold ${yr.strat - yr.bench >= 0 ? 'text-indigo-400' : 'text-amber-600'}`}>{(yr.strat - yr.bench).toFixed(2)}%</td>
+                                           </tr>
+                                       ))}
+                                   </tbody>
+                               </table>
+                           </Card>
+
+                           <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
+                               <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Tenor Variance Summary</div>
+                               <table className="w-full text-left text-xs font-mono">
+                                   <thead className="bg-slate-900/50 text-slate-400">
+                                       <tr>
+                                           <th className="px-6 py-3">Tenor</th>
+                                           <th className="px-6 py-3 text-emerald-400">Strategy</th>
+                                           <th className="px-6 py-3 text-slate-200">Benchmark</th>
+                                           <th className="px-6 py-3">Alpha</th>
                                        </tr>
-                                   ))}
-                               </tbody>
-                           </table>
-                       </Card>
+                                   </thead>
+                                   <tbody className="divide-y divide-slate-800">
+                                       {currentStats.tenors.map(t => (
+                                           <tr key={t.label} className="hover:bg-slate-800/30">
+                                               <td className="px-6 py-4 font-bold text-slate-300">{t.label}</td>
+                                               <td className="px-6 py-4 text-emerald-400 font-bold">{t.stats.strat.toFixed(2)}%</td>
+                                               <td className="px-6 py-4 text-slate-400">{t.stats.bench.toFixed(2)}%</td>
+                                               <td className={`px-6 py-4 font-bold ${t.stats.alpha >= 0 ? 'text-indigo-400' : 'text-amber-600'}`}>
+                                                   {t.stats.alpha >= 0 ? '+' : ''}{t.stats.alpha.toFixed(2)}%
+                                               </td>
+                                           </tr>
+                                       ))}
+                                   </tbody>
+                               </table>
+                           </Card>
+                       </div>
 
                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                             <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
-                                <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Rolling CAGR Comparison (Window Basis)</div>
+                                <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Rolling CAGR Comparison (Sanitized)</div>
                                 <table className="w-full text-left text-xs font-mono">
                                     <thead className="bg-slate-900/50 text-slate-400">
-                                        <tr>
-                                            <th className="px-6 py-3">Period</th>
-                                            <th className="px-6 py-3 text-emerald-400">Strategy (Min/Avg/Max)</th>
-                                            <th className="px-6 py-3 text-slate-200 font-bold">Benchmark (Min/Avg/Max)</th>
-                                        </tr>
+                                        <tr><th className="px-6 py-3">Period</th><th className="px-6 py-3 text-emerald-400">Strategy (Min/Avg/Max)</th><th className="px-6 py-3 text-slate-200">Benchmark (Min/Avg/Max)</th></tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-800">
                                         {currentStats.rolling.map(r => (
                                             <tr key={r.tenor} className="hover:bg-slate-800/30">
                                                 <td className="px-6 py-4 font-bold text-slate-300">{r.tenor}</td>
-                                                <td className="px-6 py-4">
-                                                    <span className="text-red-400 text-[10px]">{r.strat.min.toFixed(1)}</span> <span className="text-emerald-400 font-bold mx-1">{r.strat.mean.toFixed(1)}%</span> <span className="text-blue-400 text-[10px]">{r.strat.max.toFixed(1)}</span>
-                                                </td>
-                                                <td className="px-6 py-4">
-                                                    <span className="text-red-500 text-[10px]">{r.bench.min.toFixed(1)}</span> <span className="text-slate-200 font-bold mx-1">{r.bench.mean.toFixed(1)}%</span> <span className="text-indigo-400 text-[10px]">{r.bench.max.toFixed(1)}</span>
-                                                </td>
+                                                <td className="px-6 py-4"><span className="text-red-400 text-[10px]">{r.strat.min.toFixed(1)}</span> <span className="text-emerald-400 font-bold mx-1">{r.strat.mean.toFixed(1)}%</span> <span className="text-blue-400 text-[10px]">{r.strat.max.toFixed(1)}</span></td>
+                                                <td className="px-6 py-4"><span className="text-red-500 text-[10px]">{r.bench.min.toFixed(1)}</span> <span className="text-slate-200 font-bold mx-1">{r.bench.mean.toFixed(1)}%</span> <span className="text-indigo-400 text-[10px]">{r.bench.max.toFixed(1)}</span></td>
                                             </tr>
                                         ))}
                                     </tbody>
                                 </table>
                             </Card>
-
                             <Card className="p-0 overflow-hidden border-slate-800 bg-slate-900/40 shadow-xl">
                                 <div className="p-4 bg-slate-800/50 border-b border-slate-700 font-bold text-xs uppercase tracking-widest text-slate-200">Window Risk Profile</div>
                                 <table className="w-full text-left text-xs font-mono">
                                     <thead className="bg-slate-900/50 text-slate-400">
-                                        <tr><th className="px-6 py-3">Metric</th><th className="px-6 py-3 text-emerald-400">Strategy</th><th className="px-6 py-3 text-slate-200 font-bold">Benchmark</th></tr>
+                                        <tr><th className="px-6 py-3">Metric</th><th className="px-6 py-3 text-emerald-400">Strategy</th><th className="px-6 py-3 text-slate-200">Benchmark</th></tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-800">
                                         <tr><td className="px-6 py-4 text-slate-400">Ann. Volatility</td><td className="px-6 py-4 text-indigo-400 font-bold">{currentStats.strategy.volatility.toFixed(2)}%</td><td className="px-6 py-4 text-slate-200 font-bold">{currentStats.benchmark.volatility.toFixed(2)}%</td></tr>
@@ -435,14 +484,7 @@ export const BacktestEngine = () => {
                        <div className="overflow-x-auto">
                            <table className="w-full text-left text-xs font-mono">
                                <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
-                                   <tr>
-                                       <th className="px-6 py-4">Execution Date</th>
-                                       <th className="px-6 py-4">Ticker</th>
-                                       <th className="px-6 py-4 text-center">Action</th>
-                                       <th className="px-6 py-4 text-right">Shares</th>
-                                       <th className="px-6 py-4 text-right">Price</th>
-                                       <th className="px-6 py-4 text-right">Notional</th>
-                                   </tr>
+                                   <tr><th className="px-6 py-4">Date</th><th className="px-6 py-4">Ticker</th><th className="px-6 py-4 text-center">Action</th><th className="px-6 py-4 text-right">Shares</th><th className="px-6 py-4 text-right">Price</th><th className="px-6 py-4 text-right">Notional</th></tr>
                                </thead>
                                <tbody className="divide-y divide-slate-800">
                                    {detailedResult.trades
@@ -450,10 +492,8 @@ export const BacktestEngine = () => {
                                     .slice().reverse().map((t, idx) => (
                                        <tr key={idx} className="hover:bg-slate-800/40 transition-colors group">
                                            <td className="px-6 py-4 text-slate-400">{t.date}</td>
-                                           <td className="px-6 py-4 text-emerald-400 font-bold group-hover:text-white transition-colors">{t.ticker}</td>
-                                           <td className="px-6 py-4 text-center">
-                                               <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${t.type === 'BUY' ? 'bg-emerald-900/30 text-emerald-500' : 'bg-red-900/30 text-red-500'}`}>{t.type}</span>
-                                           </td>
+                                           <td className="px-6 py-4 text-emerald-400 font-bold">{t.ticker}</td>
+                                           <td className="px-6 py-4 text-center"><span className={`px-2 py-0.5 rounded font-bold text-[10px] ${t.type === 'BUY' ? 'bg-emerald-900/30 text-emerald-500' : 'bg-red-900/30 text-red-500'}`}>{t.type}</span></td>
                                            <td className="px-6 py-4 text-right text-slate-300">{t.shares.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
                                            <td className="px-6 py-4 text-right text-slate-300">${t.price.toFixed(2)}</td>
                                            <td className="px-6 py-4 text-right text-white font-bold">${t.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
