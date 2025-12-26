@@ -47,7 +47,7 @@ export const StrategyEngine = {
         const marketDataMap: Record<string, Map<string, MarketDataPoint>> = {};
         let datesSet = new Set<string>();
 
-        // 1. Data Loading
+        // 1. Data Loading & Sub-Strategy Materialization
         for (const t of allTickers) {
             let data: MarketDataPoint[] | null = await StorageService.getMarketData(t);
             if (!data && t.startsWith('STRAT:')) {
@@ -130,9 +130,12 @@ export const StrategyEngine = {
                 case RebalanceFrequency.DAILY: return true;
                 case RebalanceFrequency.WEEKLY: return curr.getDay() < prev.getDay();
                 case RebalanceFrequency.BIWEEKLY: {
-                    // Use absolute week from epoch to stay phase-consistent
-                    const weekIdx = Math.floor((curr.getTime() - (4 * 24 * 3600 * 1000)) / (7 * 24 * 3600 * 1000));
-                    return (curr.getDay() < prev.getDay()) && (weekIdx % 2 === 0);
+                    const epoch = new Date('1970-01-04'); // A Sunday
+                    const diff = curr.getTime() - epoch.getTime();
+                    const weekIdx = Math.floor(diff / (7 * 24 * 3600 * 1000));
+                    const prevWeekIdx = Math.floor((prev.getTime() - epoch.getTime()) / (7 * 24 * 3600 * 1000));
+                    // Trigger if a new week starts AND the absolute week counter is even
+                    return (weekIdx !== prevWeekIdx) && (weekIdx % 2 === 0);
                 }
                 case RebalanceFrequency.MONTHLY: return curr.getMonth() !== prev.getMonth();
                 case RebalanceFrequency.BIMONTHLY: return curr.getMonth() !== prev.getMonth() && (curr.getMonth() % 2 === 0);
@@ -158,7 +161,7 @@ export const StrategyEngine = {
         for (let i = 0; i < simDates.length; i++) {
             const date = simDates[i];
             
-            // A. Update NAV
+            // A. Update NAV (Mark-to-Market)
             let currentVal = cash;
             Object.entries(holdings).forEach(([t, q]) => {
                 const p = getSafePrice(t, date);
@@ -170,7 +173,7 @@ export const StrategyEngine = {
             const bmPrice = getSafePrice(benchmarkTicker, date);
             const bmNav = (bmPrice / (bmStart || 1)) * strategy.initialCapital;
 
-            // B. Signal Calculation
+            // B. Signal Calculation (Regime Detection)
             let riskOnW = 0;
             const activeRuleId = strategy.rules?.[0]?.ruleId || 'rule_2';
             const pPrevClose = getSafePrice(primaryTicker, simDates[i-1] || simDates[i]);
@@ -207,49 +210,59 @@ export const StrategyEngine = {
                 strategy.riskOnComponents.forEach(c => newTargets[resolveTicker(c.symbolId)] = (newTargets[resolveTicker(c.symbolId)] || 0) + (riskOnW * (c.allocation / 100)));
                 strategy.riskOffComponents.forEach(c => newTargets[resolveTicker(c.symbolId)] = (newTargets[resolveTicker(c.symbolId)] || 0) + ((1 - riskOnW) * (c.allocation / 100)));
                 targetWeights = newTargets;
-                // If Daily rebalance, execution is immediate. Otherwise schedule by delay.
                 if (pendingRebalanceDay === null) {
                     pendingRebalanceDay = i + (strategy.executionDelay || 0);
                 }
             }
 
-            // D. Execute Rebalance
+            // D. Execute Rebalance (Optimized for transaction costs)
             let rebalancedThisDay = false;
             if (pendingRebalanceDay !== null && i >= pendingRebalanceDay) {
                 rebalancedThisDay = true;
-                const costPct = (strategy.transactionCostPct + strategy.slippagePct) / 100;
+                const costMultiplier = (1 + (strategy.transactionCostPct + strategy.slippagePct) / 100);
+                const sellMultiplier = (1 - (strategy.transactionCostPct + strategy.slippagePct) / 100);
                 
-                // SELL Phase
+                // SELL Phase: Liquidate overweight assets to generate cash
                 Object.keys(holdings).forEach(t => {
                     const price = getExecutionPrice(t, date);
                     if (price <= 0) return;
                     const targetVal = (targetWeights[t] || 0) * nav;
                     const currentVal = (holdings[t] || 0) * price;
                     if (currentVal > targetVal + 1) {
-                        const sellVal = currentVal - targetVal;
-                        const cost = sellVal * costPct;
-                        const qty = sellVal / price;
+                        const sellValRaw = currentVal - targetVal;
+                        const qty = sellValRaw / price;
+                        const cost = sellValRaw * (1 - sellMultiplier);
+                        const netCash = sellValRaw - cost;
                         holdings[t] -= qty;
-                        cash += (sellVal - cost);
-                        trades.push({ date, ticker: t, type: 'SELL', value: sellVal, shares: qty, price });
+                        cash += netCash;
+                        nav -= cost;
+                        trades.push({ date, ticker: t, type: 'SELL', value: sellValRaw, shares: qty, price });
                     }
                 });
 
-                // BUY Phase
+                // BUY Phase: Reinvest available cash into underweight assets
+                // We must solve: targetVal_including_fees = cash_available
                 Object.keys(targetWeights).forEach(t => {
                     const price = getExecutionPrice(t, date);
                     if (price <= 0) return;
                     const targetVal = targetWeights[t] * nav;
                     const currentVal = (holdings[t] || 0) * price;
                     if (targetVal > currentVal + 1) {
-                        const buyVal = targetVal - currentVal;
-                        const cost = buyVal * costPct;
-                        const totalSpend = buyVal + cost;
-                        if (cash >= totalSpend && totalSpend > 0) {
-                            const qty = (buyVal) / price;
+                        let buyValDesired = targetVal - currentVal;
+                        let totalCostForDesired = buyValDesired * (costMultiplier - 1);
+                        
+                        // If we don't have enough cash for desired buy + its fees, reduce buy amount
+                        if (buyValDesired + totalCostForDesired > cash) {
+                            buyValDesired = cash / costMultiplier;
+                        }
+
+                        if (buyValDesired > 1) {
+                            const cost = buyValDesired * (costMultiplier - 1);
+                            const qty = buyValDesired / price;
                             holdings[t] = (holdings[t] || 0) + qty;
-                            cash -= totalSpend;
-                            trades.push({ date, ticker: t, type: 'BUY', value: buyVal, shares: qty, price });
+                            cash -= (buyValDesired + cost);
+                            nav -= cost;
+                            trades.push({ date, ticker: t, type: 'BUY', value: buyValDesired, shares: qty, price });
                         }
                     }
                 });
