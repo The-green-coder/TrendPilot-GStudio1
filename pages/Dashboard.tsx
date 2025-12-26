@@ -1,3 +1,4 @@
+
 import React, { useEffect, useState } from 'react';
 import { Card, Button } from '../components/ui';
 import { StorageService } from '../services/storage';
@@ -12,6 +13,10 @@ export const Dashboard = () => {
   const [symbols, setSymbols] = useState<SymbolData[]>([]);
   const [lastResult, setLastResult] = useState<BacktestResult | null>(null);
   const [dbStatus, setDbStatus] = useState({ symbols: 0, strategies: 0, results: 0 });
+  
+  const [activeSource, setActiveSource] = useState(StorageService.getActiveSource());
+  const [backupTs, setBackupTs] = useState(StorageService.getBackupTimestamp());
+  const [isBackingUp, setIsBackingUp] = useState(false);
 
   useEffect(() => {
     const s = StorageService.getStrategies();
@@ -31,12 +36,69 @@ export const Dashboard = () => {
     }
   }, []);
 
+  const handleBackup = async () => {
+      if (!confirm("This will overwrite your existing backup with current live data. Continue?")) return;
+      setIsBackingUp(true);
+      try {
+          await StorageService.createBackup();
+          setBackupTs(StorageService.getBackupTimestamp());
+          alert("System snapshot created successfully.");
+      } catch (e) {
+          alert("Backup failed. See console for details.");
+          console.error(e);
+      } finally {
+          setIsBackingUp(false);
+      }
+  };
+
+  const handleToggleSource = () => {
+      const target = activeSource === 'live' ? 'backup' : 'live';
+      if (confirm(`Switch system to ${target.toUpperCase()} data? The application will refresh.`)) {
+          StorageService.setActiveSource(target);
+      }
+  };
+
   return (
     <div className="space-y-8">
-      <div>
-          <h2 className="text-3xl font-bold text-white tracking-tight">System Dashboard</h2>
-          <p className="text-slate-400 mt-2">Overview of strategies, assets, and performance.</p>
+      <div className="flex justify-between items-start">
+          <div>
+              <h2 className="text-3xl font-bold text-white tracking-tight">System Dashboard</h2>
+              <p className="text-slate-400 mt-2">Overview of strategies, assets, and performance.</p>
+          </div>
+          <div className="flex gap-3">
+              <div className="text-right">
+                  <div className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Active Source</div>
+                  <div className={`text-sm font-mono font-bold ${activeSource === 'live' ? 'text-emerald-400' : 'text-amber-400'}`}>
+                      {activeSource.toUpperCase()} DATA
+                  </div>
+              </div>
+          </div>
       </div>
+
+      {/* Persistence & Backup Row */}
+      <Card className="bg-slate-900/40 border-slate-800 border-dashed">
+          <div className="flex flex-col md:flex-row justify-between items-center gap-6">
+              <div className="flex-1 space-y-1">
+                  <h3 className="text-lg font-bold text-slate-200">Data Persistence & Snapshots</h3>
+                  <p className="text-xs text-slate-500 max-w-xl">
+                      Manage system backups. Switching to Backup data will load the last saved snapshot of your entire environment including Symbols, Strategies, and Market Data.
+                  </p>
+                  {backupTs && (
+                      <div className="text-[10px] text-slate-600 font-mono mt-2">
+                          LAST BACKUP: {new Date(backupTs).toLocaleString()}
+                      </div>
+                  )}
+              </div>
+              <div className="flex gap-4">
+                  <Button variant="secondary" onClick={handleBackup} disabled={isBackingUp || activeSource === 'backup'}>
+                      {isBackingUp ? 'Snapshotting...' : 'Create Backup'}
+                  </Button>
+                  <Button variant={activeSource === 'live' ? 'primary' : 'secondary'} onClick={handleToggleSource} className={activeSource === 'backup' ? 'bg-amber-600 hover:bg-amber-500' : ''}>
+                      {activeSource === 'live' ? 'Switch to Backup Data' : 'Return to Live Data'}
+                  </Button>
+              </div>
+          </div>
+      </Card>
 
       {/* System Stats Row */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">

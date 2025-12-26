@@ -6,6 +6,13 @@ import { MarketDataService } from '../services/marketData';
 import { MARKET_DATA_PROVIDERS } from '../constants';
 import { SymbolData } from '../types';
 
+interface DataStatus {
+    exists: boolean;
+    count?: number;
+    start?: string;
+    end?: string;
+}
+
 export const MarketDataManager = () => {
   const [provider, setProvider] = useState(MARKET_DATA_PROVIDERS[0].id);
   const [customApiKey, setCustomApiKey] = useState('');
@@ -13,121 +20,78 @@ export const MarketDataManager = () => {
   const [isDownloading, setIsDownloading] = useState(false);
   const [statusMessage, setStatusMessage] = useState('');
   const [symbols, setSymbols] = useState<SymbolData[]>([]);
-  const [dataStatus, setDataStatus] = useState<Record<string, boolean>>({});
+  const [dataStatus, setDataStatus] = useState<Record<string, DataStatus>>({});
   const [loadingStatus, setLoadingStatus] = useState(true);
 
   useEffect(() => {
+      loadSymbolsAndStatus();
+  }, []);
+
+  const loadSymbolsAndStatus = async () => {
       const s = StorageService.getSymbols();
       setSymbols(s);
-      checkDataStatus(s);
-  }, []);
+      await checkDataStatus(s);
+  };
 
   const checkDataStatus = async (syms: SymbolData[]) => {
       setLoadingStatus(true);
-      const status: Record<string, boolean> = {};
-      await Promise.all(syms.map(async (s) => {
-          status[s.ticker] = await StorageService.hasMarketData(s.ticker);
-      }));
+      const status: Record<string, DataStatus> = {};
+      for (const s of syms) {
+          const data = await StorageService.getMarketData(s.ticker);
+          if (data && data.length > 0) {
+              // Ensure data is sorted to accurately pick start and end dates
+              const sorted = [...data].sort((a, b) => a.date.localeCompare(b.date));
+              status[s.ticker] = { 
+                  exists: true, 
+                  count: data.length,
+                  start: sorted[0].date,
+                  end: sorted[sorted.length - 1].date
+              };
+          } else {
+              status[s.ticker] = { exists: false };
+          }
+      }
       setDataStatus(status);
       setLoadingStatus(false);
   };
 
-  const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-  const handleClearData = async () => {
-    if (confirm("Are you sure you want to delete ALL historical market data? This cannot be undone.")) {
-        await StorageService.clearMarketData();
-        const currentSymbols = StorageService.getSymbols();
-        setSymbols(currentSymbols); 
-        checkDataStatus(currentSymbols);
-        setStatusMessage("Database cleared.");
-    }
-  };
-
-  const handleDownload = async (type: 'RELOAD' | 'INTRADAY' | 'NAV') => {
+  const handleDownload = async (onlyMissing: boolean) => {
     setIsDownloading(true);
     setProgress(0);
-    setStatusMessage(type === 'RELOAD' ? 'Initializing...' : 'Updating...');
+    setStatusMessage(onlyMissing ? 'Identifying missing assets...' : 'Synchronizing local history...');
 
     try {
-        if (type === 'RELOAD') {
-            const validSymbols = symbols.filter(s => !s.isList && s.ticker);
-            const total = validSymbols.length;
-            let successCount = 0;
-            let failCount = 0;
-            let skippedCount = 0;
-
-            const now = new Date();
-            // We want data at least 5 years old for valid backtests
-            const requiredDate = new Date();
-            requiredDate.setFullYear(now.getFullYear() - 5);
-            const requiredDateStr = requiredDate.toISOString().split('T')[0];
-
-            // SERIAL PROCESSING
-            for (let i = 0; i < total; i++) {
-                const sym = validSymbols[i];
-                let shouldDownload = true;
-                const existingData = await StorageService.getMarketData(sym.ticker);
-                
-                // Smart Check: Do we have data AND does it start early enough?
-                if (existingData && existingData.length > 0) {
-                    const firstDate = existingData[0].date;
-                    // If first date in DB is older than (or equal to) required date, we are good.
-                    // e.g. stored '2019-01-01', required '2020-01-01' -> Good.
-                    if (firstDate <= requiredDateStr) {
-                         shouldDownload = false;
-                    }
-                }
-
-                if (!shouldDownload) {
-                    setStatusMessage(`Skipping ${sym.ticker} (Data covers 5Y+)...`);
-                    skippedCount++;
-                    successCount++; 
-                    setProgress(Math.round(((i + 1) / total) * 100));
-                    continue;
-                }
-
-                setStatusMessage(`Fetching ${sym.ticker} (${i + 1}/${total}) via ${provider}...`);
-                
-                try {
-                    const data = await MarketDataService.fetchHistory(sym.ticker, '5y', '1d', provider, customApiKey);
-                    
-                    if (data && data.length > 0) {
-                        setStatusMessage(`Saving ${sym.ticker} to database...`);
-                        const saved = await StorageService.saveMarketData(sym.ticker, data);
-                        if (saved) {
-                            successCount++;
-                        } else {
-                            console.error(`Database write failed for ${sym.ticker}`);
-                            failCount++;
-                        }
-                    } else {
-                        failCount++;
-                    }
-                } catch (err) {
-                    failCount++;
-                    console.error(`Failed ${sym.ticker}`, err);
-                }
-
-                setProgress(Math.round(((i + 1) / total) * 100));
-                
-                if (i < total - 1) {
-                    const delay = provider === 'eodhd' ? 200 : 2500;
-                    setStatusMessage(`Waiting...`);
-                    await sleep(delay);
-                }
-            }
-
-            setStatusMessage(`Completed. Updated: ${successCount - skippedCount}, Skipped: ${skippedCount}, Failed: ${failCount}`);
-            await checkDataStatus(symbols);
-        } else {
-             await sleep(1000);
-             setProgress(100);
-             setStatusMessage('Update Completed.');
+        let targets = symbols.filter(s => !s.isList && s.ticker);
+        if (onlyMissing) {
+            targets = targets.filter(s => !dataStatus[s.ticker]?.exists);
         }
 
+        if (targets.length === 0) {
+            setStatusMessage("No updates required.");
+            setIsDownloading(false);
+            return;
+        }
+
+        for (let i = 0; i < targets.length; i++) {
+            const sym = targets[i];
+            setStatusMessage(`Downloading ${sym.ticker} (${i+1}/${targets.length})...`);
+            try {
+                const data = await MarketDataService.fetchHistory(sym.ticker, 'max', '1d', provider, customApiKey);
+                if (data.length > 0) {
+                    await StorageService.saveMarketData(sym.ticker, data);
+                }
+            } catch (e) {
+                console.error(`Download failed: ${sym.ticker}`, e);
+            }
+            setProgress(Math.round(((i + 1) / targets.length) * 100));
+            // Small pause to avoid hitting rate limits too hard and to update UI
+            await new Promise(r => setTimeout(r, 200));
+        }
+
+        setStatusMessage("Synchronization Successful.");
+        await loadSymbolsAndStatus();
     } catch (e) {
-      setStatusMessage('Error: Operation failed.');
+      setStatusMessage("Critical sync failure.");
     } finally {
       setIsDownloading(false);
     }
@@ -136,115 +100,115 @@ export const MarketDataManager = () => {
   return (
     <div className="space-y-6">
        <div>
-          <h2 className="text-2xl font-bold text-white">Market Data Manager</h2>
-          <p className="text-slate-400">Configure sources and manage historical data ingestion.</p>
+          <h2 className="text-2xl font-bold text-white tracking-tight">Market Data Center</h2>
+          <p className="text-slate-400">Manage persistence for your backtest universe.</p>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <Card className="lg:col-span-2 space-y-6">
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+            <Card className="lg:col-span-2 space-y-6 bg-slate-900/80 backdrop-blur-sm">
                 <div className="space-y-4">
-                    <div className="flex items-end gap-4">
-                        <Select
-                            label="Primary Data Provider"
-                            value={provider}
-                            onChange={(e) => setProvider(e.target.value)}
-                            options={MARKET_DATA_PROVIDERS.map(p => ({ value: p.id, label: p.name }))}
-                            className="flex-1"
+                    <Select 
+                        label="Data Source Provider" 
+                        value={provider} 
+                        onChange={e => setProvider(e.target.value)} 
+                        options={MARKET_DATA_PROVIDERS.map(p => ({ value: p.id, label: `${p.name} (${p.type})` }))} 
+                    />
+                    {provider !== 'yfinance' && (
+                        <Input 
+                            label="API Key" 
+                            type="password"
+                            value={customApiKey} 
+                            onChange={e => setCustomApiKey(e.target.value)}
+                            placeholder="Enter Key"
                         />
-                        <div className="text-sm text-slate-500 pb-3">
-                            Status: <span className="text-emerald-400">Connected</span>
-                        </div>
-                    </div>
-                    
-                    {provider === 'eodhd' && (
-                        <div className="animate-in fade-in slide-in-from-top-2 duration-300">
-                            <Input 
-                                label="EODHD Connection Key"
-                                placeholder="Paste your API Token here (Leave empty to use default)"
-                                value={customApiKey}
-                                onChange={(e) => setCustomApiKey(e.target.value)}
-                                className="font-mono text-sm"
-                            />
-                            <p className="text-xs text-slate-500 mt-1">
-                                Default: 68ff66761ac269.80544168
-                            </p>
-                        </div>
                     )}
                 </div>
 
-                <div className="p-4 bg-slate-950 rounded-lg border border-slate-800 space-y-4">
-                    <h3 className="text-lg font-medium text-slate-200">Data Operations</h3>
-                    <div className="text-sm text-yellow-500/80 bg-yellow-500/10 p-2 rounded">
-                        Note: "Reload" will fetch data if it is missing OR if existing data is older/shorter than 5 years.
+                <div className="p-5 bg-slate-950/50 rounded-xl border border-slate-800 space-y-5">
+                    <div className="flex justify-between items-center">
+                        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Persistence Status</h3>
+                        <div className="flex items-center gap-2 text-[10px] font-mono">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                            <span className="text-emerald-400 uppercase font-bold">Local Sync Connected</span>
+                        </div>
                     </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <Button 
-                            variant="secondary" 
-                            onClick={() => handleDownload('RELOAD')}
-                            disabled={isDownloading}
-                        >
-                           Reload (Ensure 5Y History)
+                    
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <Button variant="primary" onClick={() => handleDownload(true)} disabled={isDownloading}>
+                            Sync Missing Assets
                         </Button>
-                         <Button 
-                            variant="danger" 
-                            onClick={handleClearData}
-                            disabled={isDownloading}
-                        >
-                           Clear Data (Reset)
-                        </Button>
-                        <Button 
-                            variant="secondary" 
-                            onClick={() => handleDownload('INTRADAY')}
-                            disabled={isDownloading}
-                        >
-                           Update Intraday
-                        </Button>
-                        <Button 
-                            variant="primary" 
-                            onClick={() => handleDownload('NAV')}
-                            disabled={isDownloading}
-                        >
-                           Refresh Strategy NAV
+                        <Button variant="secondary" onClick={() => handleDownload(false)} disabled={isDownloading}>
+                            Refresh All Data
                         </Button>
                     </div>
+                    <Button variant="danger" className="w-full text-sm py-1.5" onClick={() => {
+                        if(confirm("Permanently wipe local history cache?")) {
+                            StorageService.clearMarketData().then(() => loadSymbolsAndStatus());
+                        }
+                    }} disabled={isDownloading}>
+                        Wipe Disk Cache
+                    </Button>
                 </div>
 
-                {(isDownloading || progress > 0) && (
-                    <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
-                        <div className="flex justify-between text-sm mb-1">
-                            <span className="text-slate-400">{isDownloading ? 'Processing...' : 'Finished'}</span>
-                            <span className="text-slate-200 font-mono">{progress}%</span>
+                {isDownloading && (
+                    <div className="space-y-3 p-4 bg-emerald-900/10 rounded-lg border border-emerald-500/20">
+                        <div className="h-1 bg-slate-800 rounded-full overflow-hidden">
+                            <div className="h-full bg-emerald-500 transition-all duration-300" style={{ width: `${progress}%` }}></div>
                         </div>
-                        <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
-                            <div 
-                                className="h-full bg-emerald-500 transition-all duration-300 ease-out" 
-                                style={{ width: `${progress}%` }}
-                            ></div>
-                        </div>
-                        <p className="mt-2 text-sm text-emerald-400 text-center">{statusMessage}</p>
+                        <p className="text-[10px] text-center text-emerald-400 font-mono tracking-widest uppercase">{statusMessage}</p>
                     </div>
                 )}
             </Card>
 
-            <Card>
-                <div className="flex justify-between items-center mb-4">
-                     <h3 className="font-semibold text-slate-200">Data Health (IndexedDB)</h3>
-                     {loadingStatus && <span className="text-xs text-slate-500 animate-pulse">Checking...</span>}
+            <Card className="lg:col-span-2 h-[600px] flex flex-col bg-slate-900/80 backdrop-blur-sm overflow-hidden">
+                <div className="flex justify-between items-center mb-4 border-b border-slate-800 pb-2">
+                    <h3 className="font-semibold text-slate-200">Inventory Analysis</h3>
+                    <span className="text-[10px] text-slate-500 font-mono">COUNT: {symbols.length}</span>
                 </div>
                 
-                <div className="space-y-2 overflow-y-auto max-h-64 pr-2 custom-scrollbar">
-                    {symbols.map(s => (
-                        <div key={s.id} className="flex justify-between items-center py-2 border-b border-slate-800 last:border-0">
-                            <span className="text-slate-400 text-sm">{s.ticker}</span>
-                            <span className={`text-xs px-2 py-0.5 rounded-full ${dataStatus[s.ticker] ? 'bg-emerald-900 text-emerald-400' : 'bg-red-900/50 text-red-400'}`}>
-                                {dataStatus[s.ticker] ? 'Available' : 'Missing'}
-                            </span>
-                        </div>
-                    ))}
-                    {symbols.length === 0 && <div className="text-sm text-slate-500">No symbols found</div>}
-                </div>
-                <div className="mt-4 pt-2 border-t border-slate-800 text-xs text-slate-500">
-                    Source: {provider === 'eodhd' ? 'EODHD API' : 'Yahoo Finance (via Proxy)'}
+                <div className="flex-1 overflow-auto custom-scrollbar">
+                    {loadingStatus ? (
+                         <div className="flex flex-col items-center justify-center h-full gap-2 text-slate-600">
+                             <div className="w-4 h-4 border border-slate-700 border-t-emerald-500 rounded-full animate-spin"></div>
+                             <span className="text-[10px] font-mono uppercase">Scanning Local Cache...</span>
+                         </div>
+                    ) : (
+                        <table className="w-full text-left text-[11px] font-mono whitespace-nowrap">
+                            <thead className="bg-slate-900 sticky top-0 z-10 text-slate-500 uppercase">
+                                <tr>
+                                    <th className="px-3 py-3 border-b border-slate-800">Symbol</th>
+                                    <th className="px-3 py-3 border-b border-slate-800 text-center">Status</th>
+                                    <th className="px-3 py-3 border-b border-slate-800 text-right">Records</th>
+                                    <th className="px-3 py-3 border-b border-slate-800">MktData StartDate</th>
+                                    <th className="px-3 py-3 border-b border-slate-800">MktData End Date</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800/50">
+                                {symbols.map(s => {
+                                    const status = dataStatus[s.ticker];
+                                    return (
+                                        <tr key={s.id} className="hover:bg-slate-800/30 transition-colors">
+                                            <td className="px-3 py-2.5 font-bold text-slate-200">{s.ticker}</td>
+                                            <td className="px-3 py-2.5 text-center">
+                                                <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold ${status?.exists ? 'bg-emerald-900/30 text-emerald-500' : 'bg-red-900/30 text-red-500'}`}>
+                                                    {status?.exists ? 'SYNCED' : 'MISSING'}
+                                                </span>
+                                            </td>
+                                            <td className="px-3 py-2.5 text-right text-slate-300">
+                                                {status?.count?.toLocaleString() || '0'}
+                                            </td>
+                                            <td className="px-3 py-2.5 text-slate-400">
+                                                {status?.start || '---'}
+                                            </td>
+                                            <td className="px-3 py-2.5 text-slate-400">
+                                                {status?.end || '---'}
+                                            </td>
+                                        </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    )}
                 </div>
             </Card>
         </div>

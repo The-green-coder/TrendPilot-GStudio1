@@ -1,19 +1,21 @@
-import React, { useState, useEffect } from 'react';
+
+import React, { useState, useEffect, useMemo } from 'react';
 import { Card, Button, Input, Select } from '../components/ui';
 import { StorageService } from '../services/storage';
 import { SymbolData, Strategy, StrategyComponent, RebalanceFrequency, PriceType, Rule } from '../types';
 import { AVAILABLE_RULES } from '../constants';
+import { StrategyEngine } from '../services/strategyEngine';
 
 export const StrategyBuilder = () => {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [symbols, setSymbols] = useState<SymbolData[]>([]);
   const [view, setView] = useState<'LIST' | 'EDITOR'>('LIST');
+  const [isSyncing, setIsSyncing] = useState<string | null>(null);
 
-  // New Strategy Form
   const [form, setForm] = useState<Partial<Strategy>>({
     name: '',
     type: 'Single',
-    rebalanceFreq: RebalanceFrequency.MONTHLY,
+    rebalanceFreq: RebalanceFrequency.WEEKLY,
     pricePreference: PriceType.CLOSE,
     initialCapital: 10000,
     transactionCostPct: 0.1,
@@ -27,26 +29,57 @@ export const StrategyBuilder = () => {
   });
 
   useEffect(() => {
-    setStrategies(StorageService.getStrategies());
-    setSymbols(StorageService.getSymbols());
+    loadStrategies();
+    const syms = StorageService.getSymbols();
+    setSymbols(syms);
+    if (syms.length > 0 && !form.benchmarkSymbolId) {
+        setForm(prev => ({ ...prev, benchmarkSymbolId: syms[0].id }));
+    }
   }, []);
 
-  const resetForm = () => {
-    setForm({
-        name: '',
-        type: 'Single',
-        rebalanceFreq: RebalanceFrequency.MONTHLY,
-        pricePreference: PriceType.CLOSE,
-        initialCapital: 10000,
-        transactionCostPct: 0.1,
-        slippagePct: 0.1,
-        executionDelay: 1,
-        backtestDuration: '1Y',
-        benchmarkSymbolId: symbols[0]?.id || '',
-        riskOnComponents: [],
-        riskOffComponents: [],
-        rules: []
-      });
+  const loadStrategies = () => {
+    setStrategies(StorageService.getStrategies());
+  };
+
+  const handleMaterialize = async (strat: Strategy) => {
+    setIsSyncing(strat.id);
+    try {
+        const sim = await StrategyEngine.runSimulation(strat, symbols);
+        const mData = sim.series.map(p => ({
+            date: p.date,
+            open: p.value,
+            high: p.value,
+            low: p.value,
+            close: p.value,
+            volume: 0
+        }));
+        await StorageService.saveMarketData(`STRAT:${strat.id}`, mData);
+        alert(`Pricing data generated for ${strat.name}`);
+    } catch (e: any) {
+        alert("Sync failed: " + e.message);
+    } finally {
+        setIsSyncing(null);
+    }
+  };
+
+  const assetOptions = useMemo(() => {
+    const opts = symbols.map(s => ({ value: s.id, label: `(SYM) ${s.ticker} - ${s.name}` }));
+    // Filter out current strategy from its own sub-options to prevent infinite recursion
+    const filteredStrats = strategies.filter(s => s.id !== form.id);
+    const stratOpts = filteredStrats.map(s => ({ value: `STRAT:${s.id}`, label: `(STRAT) ${s.name}` }));
+    return [...opts, ...stratOpts];
+  }, [symbols, strategies, form.id]);
+
+  const riskOnSum = useMemo(() => (form.riskOnComponents || []).reduce((a, b) => a + b.allocation, 0), [form.riskOnComponents]);
+  const riskOffSum = useMemo(() => (form.riskOffComponents || []).reduce((a, b) => a + b.allocation, 0), [form.riskOffComponents]);
+
+  const normalizeWeights = (type: 'riskOn' | 'riskOff') => {
+      const listKey = type === 'riskOn' ? 'riskOnComponents' : 'riskOffComponents';
+      const components = [...(form[listKey] || [])];
+      const sum = components.reduce((a, b) => a + b.allocation, 0);
+      if (sum === 0) return;
+      const normalized = components.map(c => ({ ...c, allocation: Number(((c.allocation / sum) * 100).toFixed(2)) }));
+      setForm({ ...form, [listKey]: normalized });
   };
 
   const handleEdit = (strategy: Strategy) => {
@@ -54,53 +87,50 @@ export const StrategyBuilder = () => {
       setView('EDITOR');
   };
 
+  const handleClone = (strategy: Strategy) => {
+      const { id, ...rest } = strategy;
+      setForm({
+          ...rest,
+          name: `${strategy.name} (Clone)`,
+          id: undefined 
+      });
+      setView('EDITOR');
+  };
+
   const handleDelete = (id: string) => {
-      if(confirm("Delete this strategy?")) {
-        // In a real app, delete from storage
-        const newStrategies = strategies.filter(s => s.id !== id);
-        // We need to implement delete in storage service really, but for now we simulate by saving the filtered list if the service supported it, 
-        // or just filtering local state. The StorageService doesn't have deleteStrategy exposed in the interface provided in prompt, 
-        // but assuming we'd add it. For now, let's just update local state to reflect UI action or use a mock approach.
-        // Actually, let's just stick to editing/creating as requested.
+      if (confirm('Permanently delete this strategy?')) {
+          StorageService.deleteStrategy(id);
+          loadStrategies();
       }
   };
 
   const handleSave = () => {
     if(!form.name) return;
-    
-    // If ID exists, we are updating. If not, create new ID.
-    const strategyId = form.id || Date.now().toString();
-
+    const strategyId = form.id || `strat_${Date.now()}`;
     const newStrategy: Strategy = {
-      ...form as Strategy,
       id: strategyId,
+      name: form.name || 'Unnamed Strategy',
+      type: form.type || 'Single',
+      description: form.description || '',
+      rebalanceFreq: form.rebalanceFreq || RebalanceFrequency.MONTHLY,
+      pricePreference: form.pricePreference || PriceType.CLOSE,
+      executionDelay: form.executionDelay || 0,
+      initialCapital: form.initialCapital || 10000,
+      transactionCostPct: form.transactionCostPct || 0,
+      slippagePct: form.slippagePct || 0,
+      benchmarkSymbolId: form.benchmarkSymbolId || (symbols[0]?.id || '1'),
+      backtestDuration: form.backtestDuration || '1Y',
       riskOnComponents: form.riskOnComponents || [],
       riskOffComponents: form.riskOffComponents || [],
-      benchmarkSymbolId: form.benchmarkSymbolId || (symbols[0]?.id || '1')
+      rules: form.rules || [],
+      subStrategyAllocations: form.subStrategyAllocations || []
     };
-
     StorageService.saveStrategy(newStrategy);
-    setStrategies(StorageService.getStrategies());
+    loadStrategies();
     setView('LIST');
-    resetForm();
   };
 
-  const toggleRule = (ruleId: string) => {
-    const currentRules = form.rules || [];
-    const exists = currentRules.find(r => r.ruleId === ruleId);
-    if(exists) {
-        setForm({...form, rules: currentRules.filter(r => r.ruleId !== ruleId)});
-    } else {
-        setForm({...form, rules: [...currentRules, { ruleId, weight: 100 }]}); 
-    }
-  };
-
-  const updateComponent = (
-    type: 'riskOn' | 'riskOff', 
-    index: number, 
-    field: keyof StrategyComponent, 
-    value: any
-  ) => {
+  const updateComponent = (type: 'riskOn' | 'riskOff', index: number, field: keyof StrategyComponent, value: any) => {
     const listKey = type === 'riskOn' ? 'riskOnComponents' : 'riskOffComponents';
     const currentList = [...(form[listKey] || [])];
     currentList[index] = { ...currentList[index], [field]: value };
@@ -122,46 +152,54 @@ export const StrategyBuilder = () => {
 
   const renderAssetTable = (type: 'riskOn' | 'riskOff', title: string) => {
     const components = type === 'riskOn' ? form.riskOnComponents : form.riskOffComponents;
+    const sum = type === 'riskOn' ? riskOnSum : riskOffSum;
+    const isError = Math.abs(sum - 100) > 0.01;
+
     return (
         <div className="space-y-3">
             <div className="flex justify-between items-center">
-                <h4 className="font-medium text-slate-300">{title}</h4>
-                <Button variant="ghost" className="text-xs h-8" onClick={() => addComponent(type)}>+ Add Asset</Button>
+                <div className="flex items-center gap-2">
+                    <h4 className="font-medium text-slate-300 uppercase text-xs tracking-widest">{title}</h4>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${isError ? 'bg-red-900/40 text-red-400 border border-red-500/20' : 'bg-emerald-900/40 text-emerald-400'}`}>
+                        {sum.toFixed(1)}%
+                    </span>
+                    {isError && sum > 0 && <button onClick={() => normalizeWeights(type)} className="text-[9px] text-emerald-400 hover:underline ml-2">Fix to 100%</button>}
+                </div>
+                <div className="group relative">
+                  <svg className="w-4 h-4 text-slate-500 cursor-help" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <div className="absolute right-0 bottom-full mb-2 w-72 p-3 bg-slate-800 text-[11px] text-slate-300 rounded-lg shadow-2xl opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-50 border border-slate-700 leading-relaxed">
+                    <p className="font-bold text-emerald-400 mb-1">Basket Weighting Logic:</p>
+                    Final Asset Weight = (Asset % / Sum of Basket %) × Current Regime Multiplier.<br/>
+                    Example: If Signal is 50% Risk-On, and this asset is 20% of a 100% basket, it gets 10% total NAV allocation.
+                  </div>
+                </div>
+                <Button variant="ghost" className="text-[10px] h-7 px-2 border border-slate-800" onClick={() => addComponent(type)}>+ ADD</Button>
             </div>
-            {(!components || components.length === 0) && <p className="text-sm text-slate-500 italic">No assets selected.</p>}
             {components?.map((comp, idx) => (
-                <div key={idx} className="flex flex-col sm:flex-row gap-2 items-start sm:items-center bg-slate-900 p-2 rounded border border-slate-800">
+                <div key={idx} className="flex flex-col sm:flex-row gap-2 items-start sm:items-center bg-slate-900/50 p-2 rounded border border-slate-800/50">
                     <div className="flex-1 w-full">
-                        <select 
-                            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200"
-                            value={comp.symbolId}
-                            onChange={(e) => updateComponent(type, idx, 'symbolId', e.target.value)}
-                        >
-                            {symbols.map(s => <option key={s.id} value={s.id}>{s.ticker} {s.isList ? '(List)' : ''} - {s.name}</option>)}
+                        <select className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-200" value={comp.symbolId} onChange={(e) => updateComponent(type, idx, 'symbolId', e.target.value)}>
+                            {assetOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                         </select>
                     </div>
-                    <div className="w-full sm:w-28">
-                            <select 
-                            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200"
-                            value={comp.direction}
-                            onChange={(e) => updateComponent(type, idx, 'direction', e.target.value)}
-                        >
-                            <option value="Long">Long</option>
-                            <option value="Short">Short</option>
-                        </select>
-                    </div>
-                    <div className="w-full sm:w-24 relative">
-                            <input 
-                            type="number" 
-                            className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-sm text-slate-200 text-right pr-6"
-                            value={comp.allocation}
-                            onChange={(e) => updateComponent(type, idx, 'allocation', Number(e.target.value))}
+                    <div className="w-full sm:w-44 relative flex items-center gap-2">
+                        <input 
+                          type="number" 
+                          step="0.01"
+                          className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-200 text-right pr-10" 
+                          value={comp.allocation} 
+                          placeholder="Weight"
+                          onChange={(e) => updateComponent(type, idx, 'allocation', Number(e.target.value))} 
                         />
-                        <span className="absolute right-2 top-1.5 text-xs text-slate-500">%</span>
+                        <span className="absolute right-12 top-2 text-[10px] text-slate-500 font-bold">%</span>
+                        <button onClick={() => removeComponent(type, idx)} className="text-slate-600 hover:text-red-400 p-1 transition-colors" title="Remove Asset">
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                          </svg>
+                        </button>
                     </div>
-                    <button onClick={() => removeComponent(type, idx)} className="text-slate-500 hover:text-red-400 p-1 self-end sm:self-center">
-                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                    </button>
                 </div>
             ))}
         </div>
@@ -170,96 +208,80 @@ export const StrategyBuilder = () => {
 
   if (view === 'EDITOR') {
     return (
-      <div className="max-w-4xl mx-auto space-y-6">
-        <div className="flex items-center gap-4 mb-6">
-            <Button variant="ghost" onClick={() => { setView('LIST'); resetForm(); }}>← Back</Button>
-            <h2 className="text-2xl font-bold">{form.id ? 'Edit Strategy' : 'Create Strategy'}</h2>
+      <div className="max-w-5xl mx-auto space-y-6">
+        <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center gap-4">
+                <Button variant="ghost" onClick={() => setView('LIST')} className="text-slate-400">
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg> Back
+                </Button>
+                <h2 className="text-2xl font-bold text-white">{form.id ? 'Edit Strategy' : 'New Strategy'}</h2>
+            </div>
+            <Button onClick={handleSave} className="bg-emerald-600 hover:bg-emerald-500 shadow-xl shadow-emerald-500/20">Save Changes</Button>
         </div>
-
-        <Card className="space-y-6">
-            {/* Main Config */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <Input label="Strategy Name" value={form.name || ''} onChange={e => setForm({...form, name: e.target.value})} />
-                <Select 
-                    label="Backtest Period" 
-                    value={form.backtestDuration || '1Y'} 
-                    onChange={e => setForm({...form, backtestDuration: e.target.value})}
-                    options={[
-                        { value: '3M', label: '3 Months' },
-                        { value: '6M', label: '6 Months' },
-                        { value: '1Y', label: '1 Year' },
-                        { value: '3Y', label: '3 Years' },
-                        { value: '5Y', label: '5 Years' },
-                        { value: 'Max', label: 'Max Available' }
-                    ]}
-                />
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <Select 
-                    label="Rebalancing Frequency" 
-                    value={form.rebalanceFreq || RebalanceFrequency.MONTHLY} 
-                    onChange={e => setForm({...form, rebalanceFreq: e.target.value as RebalanceFrequency})}
-                    options={Object.values(RebalanceFrequency).map(f => ({ value: f, label: f }))}
-                />
-                <Select 
-                    label="Benchmark Symbol" 
-                    value={form.benchmarkSymbolId || ''} 
-                    onChange={e => setForm({...form, benchmarkSymbolId: e.target.value})}
-                    options={[{value: '', label: 'Select Benchmark'}, ...symbols.map(s => ({ value: s.id, label: s.ticker }))]}
-                />
-                <Select 
-                    label="Price Preference" 
-                    value={form.pricePreference || PriceType.CLOSE} 
-                    onChange={e => setForm({...form, pricePreference: e.target.value as PriceType})}
-                    options={Object.values(PriceType).map(p => ({ value: p, label: p }))}
-                />
-            </div>
-            
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                 <Input type="number" label="Initial Capital" value={form.initialCapital || 0} onChange={e => setForm({...form, initialCapital: Number(e.target.value)})} />
-                 <Input type="number" label="Tx Cost (%)" value={form.transactionCostPct || 0} onChange={e => setForm({...form, transactionCostPct: Number(e.target.value)})} />
-                 <Input type="number" label="Slippage (%)" value={form.slippagePct || 0} onChange={e => setForm({...form, slippagePct: Number(e.target.value)})} />
-                 <Input type="number" label="Delay (Days)" value={form.executionDelay || 0} onChange={e => setForm({...form, executionDelay: Number(e.target.value)})} />
-            </div>
-
-            <div className="pt-4 border-t border-slate-800">
-                <h3 className="font-semibold text-lg mb-4 text-white">Rule Logic</h3>
-                <div className="grid grid-cols-1 gap-3">
-                    {AVAILABLE_RULES.map(rule => (
-                        <div 
-                            key={rule.id} 
-                            onClick={() => toggleRule(rule.id)}
-                            className={`p-4 rounded-lg border cursor-pointer transition-all ${
-                                form.rules?.find(r => r.ruleId === rule.id) 
-                                ? 'bg-emerald-900/20 border-emerald-500' 
-                                : 'bg-slate-950 border-slate-700 hover:border-slate-600'
-                            }`}
-                        >
-                            <div className="flex justify-between items-center mb-1">
-                                <span className="font-medium text-emerald-400">{rule.name}</span>
-                                {form.rules?.find(r => r.ruleId === rule.id) && (
-                                    <span className="text-xs bg-emerald-500 text-slate-900 px-2 py-0.5 rounded-full font-bold">SELECTED</span>
-                                )}
-                            </div>
-                            <p className="text-sm text-slate-400">{rule.description}</p>
+        
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 space-y-6">
+                <Card className="space-y-6 bg-slate-900/60">
+                    <section className="space-y-4">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-2">Basic Info</h3>
+                        <div className="grid grid-cols-1 gap-4">
+                            <Input label="Strategy Name" value={form.name || ''} onChange={e => setForm({...form, name: e.target.value})} />
+                            <Input label="Description (Optional)" value={form.description || ''} onChange={e => setForm({...form, description: e.target.value})} />
                         </div>
-                    ))}
-                </div>
+                    </section>
+
+                    <section className="space-y-4">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-2">Backtest Parameters</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <Input type="number" label="Initial Capital" value={form.initialCapital || 10000} onChange={e => setForm({...form, initialCapital: Number(e.target.value)})} />
+                            <Select label="Benchmark Symbol" value={form.benchmarkSymbolId || ''} onChange={e => setForm({...form, benchmarkSymbolId: e.target.value})} options={symbols.map(s => ({ value: s.id, label: `${s.ticker} - ${s.name}` }))} />
+                            <div className="grid grid-cols-2 gap-2">
+                                <Input type="number" label="Tx Cost (%)" value={form.transactionCostPct || 0} onChange={e => setForm({...form, transactionCostPct: Number(e.target.value)})} />
+                                <Input type="number" label="Slippage (%)" value={form.slippagePct || 0} onChange={e => setForm({...form, slippagePct: Number(e.target.value)})} />
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                                <Input type="number" label="Delay (Days)" value={form.executionDelay || 0} onChange={e => setForm({...form, executionDelay: Number(e.target.value)})} />
+                                <Select label="Price Ref" value={form.pricePreference || PriceType.CLOSE} onChange={e => setForm({...form, pricePreference: e.target.value as PriceType})} options={Object.values(PriceType).map(v => ({ value: v, label: v }))} />
+                            </div>
+                        </div>
+                    </section>
+
+                    <section className="space-y-4">
+                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-2">Rebalance & Logic</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                             <Select label="Rebalance Frequency" value={form.rebalanceFreq || RebalanceFrequency.WEEKLY} onChange={e => setForm({...form, rebalanceFreq: e.target.value as RebalanceFrequency})} options={Object.values(RebalanceFrequency).map(v => ({ value: v, label: v }))} />
+                            <Select label="Regime Switch Rule" value={form.rules?.[0]?.ruleId || ''} onChange={e => setForm({...form, rules: [{ ruleId: e.target.value, weight: 100 }]})} options={AVAILABLE_RULES.map(r => ({ value: r.id, label: r.name }))} />
+                        </div>
+                    </section>
+                </Card>
+
+                <Card className="space-y-6 bg-slate-900/60">
+                    <section className="space-y-4">
+                         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-widest border-b border-slate-800 pb-2">Component Baskets</h3>
+                         <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                            {renderAssetTable('riskOn', 'Risk On Components')}
+                            {renderAssetTable('riskOff', 'Risk Off Components')}
+                         </div>
+                    </section>
+                </Card>
             </div>
 
-            <div className="pt-4 border-t border-slate-800">
-                 <h3 className="font-semibold text-lg mb-4 text-white">Portfolio Universe</h3>
-                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    {renderAssetTable('riskOn', 'Risk On Assets')}
-                    {renderAssetTable('riskOff', 'Risk Off Assets')}
-                 </div>
+            <div className="space-y-6">
+                <Card className="bg-slate-950/50 border-slate-800 sticky top-6">
+                    <h4 className="text-[10px] font-bold text-slate-500 uppercase mb-3 tracking-widest">Summary Preview</h4>
+                    <div className="space-y-4 text-xs">
+                        <div className="flex justify-between"><span className="text-slate-500">Capital:</span><span className="text-slate-200 font-mono">${form.initialCapital?.toLocaleString()}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">Rebalance:</span><span className="text-slate-200">{form.rebalanceFreq}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-500">Rule:</span><span className="text-slate-200 font-medium">{AVAILABLE_RULES.find(r => r.id === form.rules?.[0]?.ruleId)?.name || 'None'}</span></div>
+                        <div className="pt-4 border-t border-slate-800">
+                            <div className="text-[9px] text-slate-600 font-bold mb-2 uppercase italic leading-relaxed">
+                                {AVAILABLE_RULES.find(r => r.id === form.rules?.[0]?.ruleId)?.description || 'No rule selected.'}
+                            </div>
+                        </div>
+                    </div>
+                </Card>
             </div>
-
-            <div className="flex justify-end pt-6">
-                <Button onClick={handleSave}>Save Strategy Config</Button>
-            </div>
-        </Card>
+        </div>
       </div>
     );
   }
@@ -267,46 +289,34 @@ export const StrategyBuilder = () => {
   return (
     <div className="space-y-6">
       <div className="flex justify-between items-center">
-        <div>
-          <h2 className="text-2xl font-bold text-white">Strategy Manager</h2>
-          <p className="text-slate-400">Define logic, universe, and execution parameters.</p>
-        </div>
-        <Button onClick={() => { resetForm(); setView('EDITOR'); }}>
-            + New Strategy
-        </Button>
+        <div><h2 className="text-2xl font-bold text-white tracking-tight">Strategy Manager</h2><p className="text-slate-400 text-sm">Design meta-strategies by combining assets and other strategies.</p></div>
+        <Button onClick={() => { setForm({ riskOnComponents: [], riskOffComponents: [], rules: [] }); setView('EDITOR'); }}>+ New Strategy</Button>
       </div>
-
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {strategies.map(strat => (
-              <Card key={strat.id} className="hover:border-emerald-500/50 transition-colors group relative flex flex-col justify-between">
-                  <div>
-                    <h3 className="text-xl font-bold text-emerald-400 mb-2 truncate">{strat.name}</h3>
-                    <div className="space-y-2 text-sm text-slate-400">
-                        <div className="flex justify-between">
-                            <span>Benchmark:</span> <span className="text-slate-200">{symbols.find(s=>s.id === strat.benchmarkSymbolId)?.ticker || 'None'}</span>
-                        </div>
-                        <div className="flex justify-between">
-                            <span>Backtest:</span> <span className="text-slate-200">{strat.backtestDuration}</span>
-                        </div>
-                        <div className="flex justify-between">
-                            <span>Freq:</span> <span className="text-slate-200">{strat.rebalanceFreq}</span>
-                        </div>
-                        <div className="flex justify-between">
-                            <span>Risk On:</span> <span className="text-slate-200">{strat.riskOnComponents.length} Assets</span>
-                        </div>
+              <Card key={strat.id} className="hover:border-emerald-500/50 transition-all group flex flex-col justify-between bg-slate-900/40 backdrop-blur-sm">
+                  <div className="relative">
+                    <div className="flex justify-between items-start mb-4">
+                        <h3 className="text-lg font-bold text-emerald-400 truncate pr-4">{strat.name}</h3>
+                        <span className="text-[9px] font-mono bg-slate-950 px-2 py-0.5 rounded text-slate-500 border border-slate-800 uppercase">{strat.rebalanceFreq}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-y-1 text-[11px] text-slate-500 mb-4">
+                        <div>Risk-On Assets</div><div className="text-slate-200 text-right">{strat.riskOnComponents.length}</div>
+                        <div>Risk-Off Assets</div><div className="text-slate-200 text-right">{strat.riskOffComponents.length}</div>
                     </div>
                   </div>
-                  <div className="mt-6 flex gap-2">
-                       <Button variant="secondary" className="w-full text-sm py-1" onClick={() => handleEdit(strat)}>Edit</Button>
-                       <Button variant="ghost" className="text-sm py-1 text-red-400 hover:text-red-300">Delete</Button>
+                  <div className="mt-4 pt-4 border-t border-slate-800 flex gap-2">
+                       <Button variant="secondary" className="flex-1 text-xs py-1.5" onClick={() => handleEdit(strat)}>Edit</Button>
+                       <Button variant="ghost" className={`px-2 border border-slate-800 ${isSyncing === strat.id ? 'animate-pulse' : ''}`} onClick={() => handleMaterialize(strat)} title="Sync Pricing Data">
+                           {isSyncing === strat.id ? '...' : <svg className="w-4 h-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>}
+                       </Button>
+                       <Button variant="ghost" className="px-2 border border-slate-800" onClick={() => handleClone(strat)} title="Clone Strategy">
+                           <svg className="w-4 h-4 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" /></svg>
+                       </Button>
+                       <Button variant="ghost" className="px-2 border border-slate-800 hover:border-red-900/50 hover:bg-red-900/10" onClick={() => handleDelete(strat.id)}><svg className="w-4 h-4 text-slate-500 hover:text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></Button>
                   </div>
               </Card>
           ))}
-          {strategies.length === 0 && (
-              <div className="col-span-3 py-12 text-center border-2 border-dashed border-slate-800 rounded-xl text-slate-500">
-                  No strategies found. Create your first one.
-              </div>
-          )}
       </div>
     </div>
   );

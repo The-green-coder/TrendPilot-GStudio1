@@ -1,5 +1,4 @@
 
-
 // Domain Types
 
 export enum Currency {
@@ -13,8 +12,12 @@ export enum Currency {
 export enum RebalanceFrequency {
   DAILY = 'Daily',
   WEEKLY = 'Weekly',
+  BIWEEKLY = 'Bi-Weekly',
   MONTHLY = 'Monthly',
-  QUARTERLY = 'Quarterly'
+  BIMONTHLY = '2-Month',
+  QUARTERLY = 'Quarterly',
+  SEMIANNUALLY = 'Semi-Annually',
+  ANNUALLY = 'Annually'
 }
 
 export enum PriceType {

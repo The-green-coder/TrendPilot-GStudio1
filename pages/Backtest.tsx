@@ -1,14 +1,45 @@
 
-
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Card, Button, Select } from '../components/ui';
 import { StorageService } from '../services/storage';
-import { Strategy, BacktestResult, SymbolData, PriceType, MarketDataPoint, Transaction, RebalanceFrequency } from '../types';
-import { analyzeBacktest } from '../services/geminiService';
+import { Strategy, BacktestResult, SymbolData } from '../types';
+import { StrategyEngine, SimResultPoint, SimTrade } from '../services/strategyEngine';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  AreaChart, Area, Legend
+  AreaChart, Area
 } from 'recharts';
+
+interface ComparisonStats {
+  strategy: { totalReturn: number; cagr: number; maxDD: number; volatility: number; sharpe: number; };
+  benchmark: { totalReturn: number; cagr: number; maxDD: number; volatility: number; sharpe: number; };
+}
+
+interface RollingStats {
+    min: number;
+    max: number;
+    mean: number;
+}
+
+interface RollingReturnItem {
+    tenor: string;
+    strategy: RollingStats;
+    benchmark: RollingStats;
+}
+
+interface TenorComparison {
+    label: string;
+    strategy: number | null;
+    benchmark: number | null;
+}
+
+interface YearlyStat {
+    year: number;
+    switches: number;
+    buys: number;
+    sells: number;
+}
+
+const STANDARD_TENORS = ['3M', '6M', '1Y', '2Y', '3Y', '4Y', '5Y', '10Y', 'Max'];
 
 export const BacktestEngine = () => {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
@@ -16,15 +47,15 @@ export const BacktestEngine = () => {
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
   const [isRunning, setIsRunning] = useState(false);
   const [result, setResult] = useState<BacktestResult | null>(null);
-  const [aiAnalysis, setAiAnalysis] = useState<string>('');
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [detailedResult, setDetailedResult] = useState<{ trades: SimTrade[], regimeSwitches: any[] } | null>(null);
+  const [compStats, setCompStats] = useState<ComparisonStats | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
-  const [dataWarning, setDataWarning] = useState('');
   
-  // Backtest Options
-  const [saveTransactions, setSaveTransactions] = useState(false);
+  const [rangeMode, setRangeMode] = useState<'Standard' | 'Custom'>('Standard');
+  const [selectedStandardTenor, setSelectedStandardTenor] = useState<string>('1Y');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
 
-  // Load initial state
   useEffect(() => {
     loadData();
   }, []);
@@ -34,658 +65,425 @@ export const BacktestEngine = () => {
     const syms = StorageService.getSymbols();
     setStrategies(s);
     setSymbols(syms);
-    if(s.length > 0 && (!selectedStrategyId || !s.find(strat => strat.id === selectedStrategyId))) {
-         setSelectedStrategyId(s[0].id);
-    }
+    if(s.length > 0 && !selectedStrategyId) setSelectedStrategyId(s[0].id);
   };
 
-  const getTicker = (id: string) => symbols.find(s => s.id === id)?.ticker || '';
+  const calculateCAGR = (startVal: number, endVal: number, days: number): number => {
+      if (days <= 0 || startVal <= 0) return 0;
+      const years = days / 252;
+      return (Math.pow(endVal / startVal, 1 / years) - 1) * 100;
+  };
 
-  const downloadTransactionsCSV = () => {
-      if (!result || result.transactions.length === 0) return;
-
-      const headers = [
-          'Date', 'Ticker', 'Action', 'Price', 'Quantity', 'Total Value', 'Tx Cost',
-          'Strategy NAV', 'Benchmark NAV',
-          'Signal Logic', 
-          'RiskOn Value', 'RiskOn Qty', 'RiskOn %',
-          'RiskOff Value', 'RiskOff Qty', 'RiskOff %'
-      ];
+  const calculateStats = (sim: SimResultPoint[]): ComparisonStats => {
+    const calc = (series: number[]) => {
+      if (series.length < 2) return { totalReturn: 0, cagr: 0, maxDD: 0, volatility: 0, sharpe: 0 };
+      const returns = [];
+      for (let i = 1; i < series.length; i++) {
+          const r = (series[i] / (series[i - 1] || 1)) - 1;
+          if (isFinite(r) && r > -0.9 && r < 3) returns.push(r);
+      }
       
-      const rows = result.transactions.map(t => [
-          t.date,
-          t.ticker,
-          t.action,
-          t.price.toFixed(2),
-          t.quantity.toFixed(4),
-          t.totalValue.toFixed(2),
-          t.cost.toFixed(2),
-          (t.strategyNav || 0).toFixed(2),
-          (t.benchmarkNav || 0).toFixed(2),
-          `"${t.signalReason || ''}"`,
-          (t.riskOnNotional || 0).toFixed(2),
-          (t.riskOnQty || 0).toFixed(4),
-          (t.riskOnPct || 0).toFixed(1) + '%',
-          (t.riskOffNotional || 0).toFixed(2),
-          (t.riskOffQty || 0).toFixed(4),
-          (t.riskOffPct || 0).toFixed(1) + '%'
-      ]);
-
-      const csvContent = [
-          headers.join(','),
-          ...rows.map(row => row.join(','))
-      ].join('\n');
-
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.setAttribute('href', url);
-      link.setAttribute('download', `transactions_${result.strategyId}_${result.runDate.split('T')[0]}.csv`);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      const first = series[0];
+      const last = series[series.length - 1];
+      const totalReturn = ((last - first) / (first || 1)) * 100;
+      const years = series.length / 252;
+      const cagr = (Math.pow(last / (first || 1), 1 / (years || 1)) - 1) * 100;
+      
+      const mean = returns.length > 0 ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
+      const variance = returns.length > 1 ? returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (returns.length - 1) : 0;
+      const vol = Math.sqrt(variance * 252) * 100;
+      
+      let peak = -Infinity, mdd = 0;
+      series.forEach(v => { if (v > peak) peak = v; const dd = (peak - v) / (peak || 1); if (dd > mdd) mdd = dd; });
+      
+      return { 
+          totalReturn: Number(totalReturn.toFixed(2)), 
+          cagr: Number(cagr.toFixed(2)), 
+          maxDD: Number((mdd * 100).toFixed(2)), 
+          volatility: Number(vol.toFixed(2)), 
+          sharpe: Number((vol > 0 ? cagr / vol : 0).toFixed(2)) 
+      };
+    };
+    return { strategy: calc(sim.map(p => p.value)), benchmark: calc(sim.map(p => p.benchmarkValue)) };
   };
+
+  const tenorComparisons = useMemo((): TenorComparison[] => {
+      if (!result) return [];
+      const series = result.navSeries;
+      const tenors = [
+          { label: '1 Year', days: 252 },
+          { label: '3 Year', days: 756 },
+          { label: '5 Year', days: 1260 },
+          { label: 'Selected Period', days: series.length }
+      ];
+
+      return tenors.map(t => {
+          if (series.length < t.days && t.label !== 'Selected Period') return { label: t.label, strategy: null, benchmark: null };
+          
+          const window = Math.min(t.days, series.length);
+          const startIdx = series.length - window;
+          const endIdx = series.length - 1;
+          
+          const sCAGR = calculateCAGR(series[startIdx].value, series[endIdx].value, window);
+          const bCAGR = calculateCAGR(series[startIdx].benchmarkValue, series[endIdx].benchmarkValue, window);
+          
+          return { label: t.label, strategy: sCAGR, benchmark: bCAGR };
+      });
+  }, [result]);
+
+  const rollingReturns = useMemo((): RollingReturnItem[] => {
+      if (!result) return [];
+      const series = result.navSeries;
+
+      const getRollingStats = (window: number) => {
+          if (series.length < window + 1) return null;
+          
+          const sReturns: number[] = [];
+          const bReturns: number[] = [];
+          
+          for (let i = window; i < series.length; i++) {
+              const sRet = (series[i].value / (series[i - window].value || 1)) - 1;
+              const bRet = (series[i].benchmarkValue / (series[i - window].benchmarkValue || 1)) - 1;
+              
+              if (isFinite(sRet) && isFinite(bRet)) {
+                  sReturns.push(sRet);
+                  bReturns.push(bRet);
+              }
+          }
+
+          if (sReturns.length === 0) return null;
+
+          const years = window / 252;
+          const toCAGR = (val: number) => (Math.pow(1 + val, 1 / years) - 1) * 100;
+
+          const calc = (rets: number[]): RollingStats => {
+              const min = Math.min(...rets);
+              const max = Math.max(...rets);
+              const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+              return {
+                  min: toCAGR(min),
+                  max: toCAGR(max),
+                  mean: toCAGR(mean)
+              };
+          };
+
+          return {
+              strategy: calc(sReturns),
+              benchmark: calc(bReturns)
+          };
+      };
+
+      return [
+          { tenor: '3M', window: 63 },
+          { tenor: '6M', window: 126 },
+          { tenor: '1Y', window: 252 },
+          { tenor: '2Y', window: 504 },
+          { tenor: '3Y', window: 756 }
+      ].map(t => {
+          const stats = getRollingStats(t.window);
+          return stats ? { tenor: t.tenor, ...stats } : null;
+      }).filter(x => x !== null) as RollingReturnItem[];
+  }, [result]);
+
+  const yearlyStats = useMemo((): YearlyStat[] => {
+      if (!result || !detailedResult) return [];
+      const statsMap: Record<number, YearlyStat> = {};
+      
+      result.navSeries.forEach(p => {
+          const year = new Date(p.date).getFullYear();
+          if (!statsMap[year]) statsMap[year] = { year, switches: 0, buys: 0, sells: 0 };
+      });
+
+      detailedResult.regimeSwitches.forEach(s => {
+          const year = new Date(s.date).getFullYear();
+          if (statsMap[year]) statsMap[year].switches++;
+      });
+
+      detailedResult.trades.forEach(t => {
+          const year = new Date(t.date).getFullYear();
+          if (statsMap[year]) {
+              if (t.type === 'BUY') statsMap[year].buys++;
+              else statsMap[year].sells++;
+          }
+      });
+
+      return Object.values(statsMap).sort((a, b) => a.year - b.year);
+  }, [result, detailedResult]);
 
   const runBacktest = async () => {
-    // CRITICAL: Reload strategies from storage immediately before running.
-    const freshStrategies = StorageService.getStrategies();
-    setStrategies(freshStrategies);
-    
     setIsRunning(true);
-    setResult(null);
     setErrorMessage('');
-    setDataWarning('');
-    setAiAnalysis('');
-    
+    setResult(null);
     try {
-        const strategy = freshStrategies.find(s => s.id === selectedStrategyId);
-        if(!strategy) throw new Error("Strategy not found");
+        const strat = strategies.find(s => s.id === selectedStrategyId);
+        if (!strat) throw new Error("Select a strategy");
 
-        if (strategy.riskOnComponents.length === 0) throw new Error("Strategy must have at least one Risk On asset.");
-
-        const benchmarkTicker = getTicker(strategy.benchmarkSymbolId);
-        
-        // 1. Gather Required Tickers
-        const riskOnTickers = strategy.riskOnComponents.map(c => getTicker(c.symbolId).trim());
-        const riskOffTickers = strategy.riskOffComponents.map(c => getTicker(c.symbolId).trim());
-        const allTickers = Array.from(new Set([benchmarkTicker.trim(), ...riskOnTickers, ...riskOffTickers])).filter(t => t);
-
-        // 2. Load Data from Storage (Async)
-        const marketDataMap: Record<string, Map<string, MarketDataPoint>> = {};
-        const missingData: string[] = [];
-        let datesSet = new Set<string>();
-
-        console.log(`Loading data for: ${allTickers.join(', ')} from IndexedDB...`);
-
-        for(const t of allTickers) {
-            const data = await StorageService.getMarketData(t);
-            if(!data || data.length === 0) {
-                missingData.push(t);
-            } else {
-                const map = new Map<string, MarketDataPoint>();
-                data.forEach(d => {
-                    map.set(d.date, d);
-                    datesSet.add(d.date); 
-                });
-                marketDataMap[t] = map;
-            }
+        let startD: string | undefined;
+        if (rangeMode === 'Standard' && selectedStandardTenor !== 'Max') {
+            const daysMap: any = { '3M': 90, '6M': 180, '1Y': 365, '2Y': 730, '3Y': 1095, '4Y': 1460, '5Y': 1825, '10Y': 3650 };
+            const date = new Date();
+            date.setDate(date.getDate() - (daysMap[selectedStandardTenor] || 365));
+            startD = date.toISOString().split('T')[0];
+        } else if (rangeMode === 'Custom') {
+            startD = customStart;
         }
 
-        if(missingData.length > 0) {
-            throw new Error(`Missing market data for: ${missingData.join(', ')}. Please go to Market Data Manager and click Reload.`);
-        }
-
-        // 3. Align Dates & Calculate Duration
-        const sortedDates = Array.from(datesSet).sort();
+        const sim = await StrategyEngine.runSimulation(strat, symbols, startD, rangeMode === 'Custom' ? customEnd : undefined);
+        const stats = calculateStats(sim.series);
+        setCompStats(stats);
+        setDetailedResult({ trades: sim.trades, regimeSwitches: sim.regimeSwitches });
         
-        const durationMap: Record<string, number> = { '3M': 90, '6M': 180, '1Y': 365, '3Y': 1095, '5Y': 1825, 'Max': 99999 };
-        const durationDays = durationMap[strategy.backtestDuration] || 1825; 
-        
-        const now = new Date();
-        const cutoffDateObj = new Date(now.getTime());
-        cutoffDateObj.setDate(cutoffDateObj.getDate() - durationDays);
-        const cutoffDate = cutoffDateObj.toISOString().split('T')[0];
-        
-        // Find start index based on Cutoff
-        const startDateIndex = sortedDates.findIndex(d => d >= cutoffDate);
-        
-        // Data Duration Check
-        if (startDateIndex === -1 && strategy.backtestDuration !== 'Max') {
-            if (sortedDates.length > 0 && sortedDates[0] > cutoffDate) {
-                 setDataWarning(`Warning: Stored market data for these symbols starts on ${sortedDates[0]}, but you requested a backtest starting from ${cutoffDate}. The results will only cover the available data range. Please go to Market Data Manager and click "Reload (Ensure 5Y)" to fetch deeper history.`);
-            }
-        }
-
-        const actualStartIndex = (strategy.backtestDuration === 'Max' || startDateIndex === -1) ? 0 : startDateIndex;
-        
-        const simulationDates = sortedDates.slice(actualStartIndex);
-        if (simulationDates.length === 0) throw new Error("Not enough data points for simulation.");
-
-        console.log(`Simulation running from ${simulationDates[0]} to ${simulationDates[simulationDates.length-1]}`);
-
-        // 4. Helper: Get Price based on Preference
-        const getExecutionPrice = (ticker: string, date: string): number | null => {
-            const point = marketDataMap[ticker].get(date);
-            if (!point) return null;
-            // Execution uses Preference
-            switch (strategy.pricePreference) {
-                case PriceType.OPEN: return point.open;
-                case PriceType.HIGH: return point.high;
-                case PriceType.LOW: return point.low;
-                case PriceType.AVG: return (point.high + point.low + point.close) / 3;
-                case PriceType.CLOSE: 
-                default: return point.close;
-            }
-        };
-
-        // 5. Initialize Prices and Benchmark Baseline
-        let lastKnownPrices: Record<string, number> = {};
-        
-        allTickers.forEach(t => {
-            let price = 0;
-            // Scan forward in simulation dates until we find a price
-            for(const d of simulationDates) {
-                const p = marketDataMap[t].get(d);
-                if(p) { price = p.close; break; }
-            }
-            lastKnownPrices[t] = price || 1; 
-        });
-
-        // Benchmark Sync
-        let benchmarkStartPrice = 0;
-        for(const d of simulationDates) {
-             const p = marketDataMap[benchmarkTicker].get(d);
-             if(p) { benchmarkStartPrice = p.close; break; }
-        }
-        if(!benchmarkStartPrice) benchmarkStartPrice = 1;
-
-        // 6. Pre-calculate Indicators (MAs) using FULL history
-        const primaryRiskOnTicker = riskOnTickers[0];
-        const primaryFullHistory = sortedDates.map(d => {
-            const point = marketDataMap[primaryRiskOnTicker].get(d);
-            return {
-                date: d, 
-                price: point ? point.close : null // STRICTLY USE CLOSE FOR SIGNALS
-            };
-        }).filter(p => p.price !== null) as {date: string, price: number}[];
-
-        const getMA = (period: number, date: string) => {
-             const idx = primaryFullHistory.findIndex(p => p.date === date);
-             if (idx < period - 1 || idx === -1) return null;
-             let sum = 0;
-             for(let i=0; i<period; i++) sum += primaryFullHistory[idx - i].price;
-             return sum / period;
-        };
-
-        // 7. Simulation Loop Variables
-        const totalOnAlloc = strategy.riskOnComponents.reduce((s, c) => s + c.allocation, 0) || 100;
-        const totalOffAlloc = strategy.riskOffComponents.reduce((s, c) => s + c.allocation, 0) || 100;
-
-        let nav = strategy.initialCapital;
-        const simData = [];
-        let currentAllocations = { riskOn: 1.0, riskOff: 0.0 }; // Start 100% Risk On default
-        const activeRuleId = strategy.rules.length > 0 ? strategy.rules[0].ruleId : null;
-        
-        const recordedTransactions: Transaction[] = [];
-
-        // Portfolio Units Tracking
-        let portfolioHoldings: Record<string, number> = {};
-        // Initialize Holdings (Start with Cash)
-        let cash = nav;
-        
-        // Signal Reason String
-        let currentSignalReason = "Initial Allocation";
-
-        const isRebalanceDay = (dateStr: string, index: number, freq: RebalanceFrequency): boolean => {
-            if (index === 0) return true; // Always rebalance on day 1
-            const currentDate = new Date(dateStr);
-            const prevDate = new Date(simulationDates[index - 1]);
-            
-            switch(freq) {
-                case RebalanceFrequency.DAILY: return true;
-                case RebalanceFrequency.WEEKLY: 
-                    return currentDate.getDay() < prevDate.getDay() || (currentDate.getTime() - prevDate.getTime()) > 7 * 86400000;
-                case RebalanceFrequency.MONTHLY:
-                    return currentDate.getMonth() !== prevDate.getMonth();
-                case RebalanceFrequency.QUARTERLY:
-                     return Math.floor(currentDate.getMonth() / 3) !== Math.floor(prevDate.getMonth() / 3);
-                default: return false;
-            }
-        };
-
-        for(let i = 0; i < simulationDates.length; i++) {
-            const date = simulationDates[i];
-            
-            // --- A. Calculate Current Portfolio Value ---
-            let currentPortfolioValue = cash;
-            const currentExecutionPrices: Record<string, number> = {};
-            
-            // Update Prices and Calculate Value
-            allTickers.forEach(ticker => {
-                const price = getExecutionPrice(ticker, date);
-                if (price) {
-                    currentExecutionPrices[ticker] = price;
-                    lastKnownPrices[ticker] = price;
-                } else {
-                    currentExecutionPrices[ticker] = lastKnownPrices[ticker];
-                }
-                
-                if (portfolioHoldings[ticker]) {
-                    currentPortfolioValue += portfolioHoldings[ticker] * currentExecutionPrices[ticker];
-                }
-            });
-            
-            nav = currentPortfolioValue;
-
-            // --- B. Benchmark Value Update ---
-            let currentBmPrice = getExecutionPrice(benchmarkTicker, date);
-            if (!currentBmPrice) currentBmPrice = lastKnownPrices[benchmarkTicker] || benchmarkStartPrice;
-            const benchmarkNAV = (currentBmPrice / benchmarkStartPrice) * strategy.initialCapital;
-
-            // --- C. Signal Generation ---
-            const pointPrimary = marketDataMap[primaryRiskOnTicker].get(date);
-            const pPrimaryClose = pointPrimary ? pointPrimary.close : null;
-            let targetRiskOnWeight = currentAllocations.riskOn; // Hold previous by default
-
-            if (pPrimaryClose !== null) {
-                const ma20 = getMA(20, date);
-                const ma25 = getMA(25, date);
-                const ma50 = getMA(50, date);
-                const ma100 = getMA(100, date);
-
-                if (activeRuleId === 'rule_1') {
-                    if (ma25 && ma50 && ma100) {
-                        let w = 0;
-                        let reasons = [];
-                        if (pPrimaryClose > ma25) { w += 0.25; reasons.push(`Close(${pPrimaryClose.toFixed(2)}) > MA25(${ma25.toFixed(2)})`); }
-                        if (pPrimaryClose > ma50) { w += 0.50; reasons.push(`> MA50(${ma50.toFixed(2)})`); }
-                        if (pPrimaryClose > ma100) { w += 0.25; reasons.push(`> MA100(${ma100.toFixed(2)})`); }
-                        if (reasons.length === 0) reasons.push("Close < All MAs");
-                        targetRiskOnWeight = w;
-                        currentSignalReason = reasons.join(' & ');
-                    }
-                } else if (activeRuleId === 'rule_2') {
-                    if (ma20 && ma50 && ma100) {
-                        let w = 0;
-                        let reasons = [];
-                        if (pPrimaryClose > ma20) { w += 0.50; reasons.push(`Close(${pPrimaryClose.toFixed(2)}) > MA20(${ma20.toFixed(2)})`); }
-                        if (pPrimaryClose > ma50) { w += 0.25; reasons.push(`> MA50(${ma50.toFixed(2)})`); }
-                        if (pPrimaryClose > ma100) { w += 0.25; reasons.push(`> MA100(${ma100.toFixed(2)})`); }
-                        if (reasons.length === 0) reasons.push("Close < All MAs");
-                        targetRiskOnWeight = w;
-                        currentSignalReason = reasons.join(' & ');
-                    }
-                }
-            }
-            
-            currentAllocations.riskOn = targetRiskOnWeight;
-            currentAllocations.riskOff = 1.0 - targetRiskOnWeight;
-
-            // --- D. Delta Rebalancing Execution ---
-            if (isRebalanceDay(date, i, strategy.rebalanceFreq)) {
-                
-                // 1. Calculate Target Dollar Amounts for every Asset
-                const targetValues: Record<string, number> = {};
-                
-                // Calculate Portfolio Snapshot for Reporting
-                const riskOnNotional = nav * currentAllocations.riskOn;
-                const riskOffNotional = nav * currentAllocations.riskOff;
-                const riskOnPct = currentAllocations.riskOn * 100;
-                const riskOffPct = currentAllocations.riskOff * 100;
-
-                // Risk On Targets
-                strategy.riskOnComponents.forEach(comp => {
-                    const ticker = getTicker(comp.symbolId).trim();
-                    const basketWeight = (comp.allocation / totalOnAlloc); 
-                    const finalWeight = currentAllocations.riskOn * basketWeight;
-                    targetValues[ticker] = nav * finalWeight;
-                });
-
-                // Risk Off Targets
-                strategy.riskOffComponents.forEach(comp => {
-                    const ticker = getTicker(comp.symbolId).trim();
-                    const basketWeight = (comp.allocation / totalOffAlloc);
-                    const finalWeight = currentAllocations.riskOff * basketWeight;
-                    targetValues[ticker] = nav * finalWeight;
-                });
-
-                // Calculate Target Quantities (Sum of shares for bucket stats)
-                let riskOnQty = 0;
-                let riskOffQty = 0;
-                
-                Object.keys(targetValues).forEach(t => {
-                    const price = currentExecutionPrices[t] || 1;
-                    const qty = targetValues[t] / price;
-                    const isRiskOn = strategy.riskOnComponents.some(c => getTicker(c.symbolId) === t);
-                    if(isRiskOn) riskOnQty += qty;
-                    else riskOffQty += qty;
-                });
-
-
-                // 2. Identify Deltas (Target - Current)
-                const involvedTickers = new Set([...Object.keys(portfolioHoldings), ...Object.keys(targetValues)]);
-                
-                // Phase 1: SELLS (Generate Cash)
-                involvedTickers.forEach(ticker => {
-                    const price = currentExecutionPrices[ticker];
-                    const currentShares = portfolioHoldings[ticker] || 0;
-                    const currentValue = currentShares * price;
-                    const targetValue = targetValues[ticker] || 0;
-                    
-                    const diff = targetValue - currentValue;
-
-                    // If Diff is negative (Overweight), SELL
-                    if (diff < -1 && price > 0) {
-                        const valToSell = Math.abs(diff);
-                        const qtyToSell = valToSell / price;
-                        const txCost = valToSell * (strategy.transactionCostPct / 100);
-                        
-                        portfolioHoldings[ticker] = currentShares - qtyToSell;
-                        if (portfolioHoldings[ticker] < 0.0001) delete portfolioHoldings[ticker];
-                        
-                        const netCash = valToSell - txCost;
-                        cash += netCash;
-                        nav -= txCost; 
-
-                        if (saveTransactions) {
-                            recordedTransactions.push({
-                                date, ticker, action: 'SELL', price, quantity: qtyToSell, totalValue: valToSell, cost: txCost,
-                                signalReason: currentSignalReason,
-                                riskOnNotional, riskOnQty, riskOnPct,
-                                riskOffNotional, riskOffQty, riskOffPct,
-                                strategyNav: nav,
-                                benchmarkNav: benchmarkNAV
-                            });
-                        }
-                    }
-                });
-
-                // Phase 2: BUYS (Deploy Cash)
-                involvedTickers.forEach(ticker => {
-                    const price = currentExecutionPrices[ticker];
-                    const currentShares = portfolioHoldings[ticker] || 0;
-                    const currentValue = currentShares * price;
-                    const targetValue = targetValues[ticker] || 0;
-                    
-                    const diff = targetValue - currentValue;
-
-                    // If Diff is positive (Underweight) AND we have cash
-                    if (diff > 1 && cash > 1 && price > 0) {
-                        const costFactor = 1 + (strategy.transactionCostPct / 100);
-                        const maxBuyableValue = cash / costFactor;
-                        const valToBuy = Math.min(diff, maxBuyableValue);
-                        
-                        if (valToBuy > 1) {
-                            const qtyToBuy = valToBuy / price;
-                            const txCost = valToBuy * (strategy.transactionCostPct / 100);
-                            
-                            portfolioHoldings[ticker] = currentShares + qtyToBuy;
-                            cash -= (valToBuy + txCost);
-                            nav -= txCost;
-
-                            if (saveTransactions) {
-                                recordedTransactions.push({
-                                    date, ticker, action: 'BUY', price, quantity: qtyToBuy, totalValue: valToBuy, cost: txCost,
-                                    signalReason: currentSignalReason,
-                                    riskOnNotional, riskOnQty, riskOnPct,
-                                    riskOffNotional, riskOffQty, riskOffPct,
-                                    strategyNav: nav,
-                                    benchmarkNav: benchmarkNAV
-                                });
-                            }
-                        }
-                    }
-                });
-            }
-
-            simData.push({
-                date,
-                value: Number(nav.toFixed(2)),
-                benchmarkValue: Number(benchmarkNAV.toFixed(2)),
-                riskOn: Number((currentAllocations.riskOn * 100).toFixed(0)),
-                riskOff: Number((currentAllocations.riskOff * 100).toFixed(0))
-            });
-        }
-
-        if(simData.length === 0) throw new Error("Simulation yielded no data.");
-        
-        const finalNav = simData[simData.length-1].value;
-        const totalReturn = ((finalNav - strategy.initialCapital) / strategy.initialCapital) * 100;
-        const years = simData.length / 252;
-        const cagr = (Math.pow(finalNav / strategy.initialCapital, 1 / (years || 1)) - 1) * 100;
-
-        let peak = -Infinity;
-        let maxDd = 0;
-        simData.forEach(d => {
-            if(d.value > peak) peak = d.value;
-            const dd = (peak - d.value) / peak;
-            if(dd > maxDd) maxDd = dd;
-        });
-
-        const lastAlloc = simData[simData.length - 1];
-
-        const mockRes: BacktestResult = {
-            strategyId: selectedStrategyId,
+        const finalRes: BacktestResult = {
+            strategyId: strat.id,
             runDate: new Date().toISOString(),
-            stats: {
-                cagr: Number(cagr.toFixed(2)),
-                maxDrawdown: Number((maxDd * 100).toFixed(2)),
-                sharpeRatio: 0,
-                totalReturn: Number(totalReturn.toFixed(2)),
-                winRate: 0
-            },
-            navSeries: simData,
+            stats: { cagr: stats.strategy.cagr, maxDrawdown: stats.strategy.maxDD, sharpeRatio: stats.strategy.sharpe, totalReturn: stats.strategy.totalReturn, winRate: 0 },
+            navSeries: sim.series,
             allocations: [],
-            transactions: recordedTransactions,
-            latestAllocation: {
-                date: lastAlloc.date,
-                riskOn: lastAlloc.riskOn,
-                riskOff: lastAlloc.riskOff
-            }
+            transactions: [],
+            latestAllocation: { date: sim.series[sim.series.length-1].date, riskOn: sim.series[sim.series.length-1].riskOn, riskOff: sim.series[sim.series.length-1].riskOff }
         };
-        
-        setResult(mockRes);
-        StorageService.saveBacktestResult(mockRes);
-
-    } catch (err: any) {
-        setErrorMessage(err.message);
-        console.error(err);
+        setResult(finalRes);
+        StorageService.saveBacktestResult(finalRes);
+    } catch (e: any) {
+        setErrorMessage(e.message);
     } finally {
         setIsRunning(false);
     }
   };
 
-  const handleAIAnalysis = async () => {
-    if (!result || !selectedStrategyId) return;
-    setIsAnalyzing(true);
-    const strategy = strategies.find(s => s.id === selectedStrategyId);
-    if (strategy) {
-      const text = await analyzeBacktest(strategy, result);
-      setAiAnalysis(text);
-    }
-    setIsAnalyzing(false);
-  };
-
-  const benchmarkLabel = selectedStrategyId ? getTicker(strategies.find(s=>s.id === selectedStrategyId)?.benchmarkSymbolId || '') : 'Benchmark';
-
   return (
     <div className="space-y-6">
-       <div className="flex justify-between items-end">
+       <div className="flex justify-between items-end flex-wrap gap-4">
             <div>
-                <h2 className="text-2xl font-bold text-white">Backtesting Engine</h2>
-                <p className="text-slate-400">Run simulations with real historical data.</p>
+                <h2 className="text-2xl font-bold text-white tracking-tight">Backtesting Engine</h2>
+                <p className="text-slate-400 font-medium italic">Advanced performance analytics with Min/Mean/Max rolling returns.</p>
             </div>
-            <div className="flex flex-col gap-2 items-end">
-                <div className="flex gap-4 items-end bg-slate-900 p-2 rounded-lg border border-slate-800">
-                    <Select 
-                        value={selectedStrategyId}
-                        onChange={(e) => setSelectedStrategyId(e.target.value)}
-                        options={strategies.map(s => ({ value: s.id, label: s.name }))}
-                        className="w-64"
-                    />
-                    <Button onClick={runBacktest} disabled={isRunning || !selectedStrategyId}>
-                        {isRunning ? 'Simulating...' : 'Run Backtest'}
-                    </Button>
+            <div className="flex gap-4 items-end bg-slate-900 p-4 rounded-xl border border-slate-800 shadow-2xl">
+                <Select label="Strategy" value={selectedStrategyId} onChange={(e) => setSelectedStrategyId(e.target.value)} options={strategies.map(s => ({ value: s.id, label: s.name }))} className="w-64" />
+                <div className="flex flex-col gap-1.5 min-w-[120px]">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Range Mode</label>
+                    <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-800">
+                        <button onClick={() => setRangeMode('Standard')} className={`flex-1 px-3 py-1.5 rounded-md text-[10px] font-bold uppercase transition-all ${rangeMode === 'Standard' ? 'bg-emerald-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}>Std</button>
+                        <button onClick={() => setRangeMode('Custom')} className={`flex-1 px-3 py-1.5 rounded-md text-[10px] font-bold uppercase transition-all ${rangeMode === 'Custom' ? 'bg-emerald-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}>Custom</button>
+                    </div>
                 </div>
-                 <label className="flex items-center gap-2 text-sm text-slate-400 cursor-pointer">
-                    <input 
-                        type="checkbox" 
-                        checked={saveTransactions} 
-                        onChange={e => setSaveTransactions(e.target.checked)}
-                        className="rounded bg-slate-800 border-slate-600 text-emerald-500 focus:ring-emerald-500"
-                    />
-                    Save Transaction Data
-                </label>
+
+                {rangeMode === 'Standard' ? (
+                    <div className="w-24"><Select label="Tenor" value={selectedStandardTenor} onChange={e => setSelectedStandardTenor(e.target.value)} options={STANDARD_TENORS.map(t => ({ value: t, label: t }))} /></div>
+                ) : (
+                    <div className="flex gap-2">
+                        <div className="w-32"><label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Start</label><input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:ring-1 focus:ring-emerald-500" /></div>
+                        <div className="w-32"><label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">End</label><input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:ring-1 focus:ring-emerald-500" /></div>
+                    </div>
+                )}
+                <Button onClick={runBacktest} disabled={isRunning || !selectedStrategyId} className="h-10 px-6 font-bold">{isRunning ? '...' : 'RUN'}</Button>
             </div>
        </div>
 
-       {errorMessage && (
-           <div className="p-4 bg-red-900/20 border border-red-500/50 rounded-lg text-red-200">
-               Error: {errorMessage}
-           </div>
-       )}
+       {errorMessage && <div className="p-4 bg-red-900/20 border border-red-500/50 rounded-lg text-red-200 shadow-xl">Error: {errorMessage}</div>}
 
-       {dataWarning && (
-           <div className="p-4 bg-yellow-900/20 border border-yellow-500/50 rounded-lg text-yellow-200">
-               {dataWarning}
-           </div>
-       )}
-
-       {result ? (
-           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-               {/* Stats Cards */}
-               <Card className="lg:col-span-1 space-y-6 h-fit">
-                    <h3 className="font-bold text-slate-200 border-b border-slate-800 pb-2">Performance Metrics</h3>
-                    <div className="grid grid-cols-2 lg:grid-cols-1 gap-4">
-                        <div>
-                            <div className="text-xs text-slate-500 uppercase">Total Return</div>
-                            <div className={`text-2xl font-mono ${result.stats.totalReturn >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                                {result.stats.totalReturn > 0 ? '+' : ''}{result.stats.totalReturn}%
-                            </div>
+       {result && compStats && (
+           <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+               <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                   <Card className="lg:col-span-1 space-y-6">
+                        <div className="space-y-6">
+                          <h3 className="font-bold text-slate-200 border-b border-slate-800 pb-2 uppercase text-xs tracking-widest">Performance</h3>
+                          <div className="space-y-4">
+                              <div><div className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Strategy Return</div><div className={`text-3xl font-mono font-bold ${result.stats.totalReturn >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{result.stats.totalReturn}%</div></div>
+                              <div className="grid grid-cols-2 gap-4">
+                                  <div><div className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">CAGR</div><div className="text-lg font-mono text-slate-200">{result.stats.cagr}%</div></div>
+                                  <div><div className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Max DD</div><div className="text-lg font-mono text-red-400">-{result.stats.maxDrawdown}%</div></div>
+                              </div>
+                          </div>
                         </div>
-                        <div>
-                            <div className="text-xs text-slate-500 uppercase">CAGR</div>
-                            <div className="text-xl font-mono text-slate-200">{result.stats.cagr}%</div>
-                        </div>
-                        <div>
-                            <div className="text-xs text-slate-500 uppercase">Max Drawdown</div>
-                            <div className="text-xl font-mono text-red-400">{result.stats.maxDrawdown}%</div>
-                        </div>
-                    </div>
-
-                    {result.latestAllocation && (
-                        <div className="pt-4 border-t border-slate-800">
-                             <div className="text-xs text-slate-500 uppercase mb-2">Latest Signal ({result.latestAllocation.date})</div>
-                             <div className="flex gap-2">
-                                <div className={`flex-1 p-2 rounded text-center text-sm font-bold border ${result.latestAllocation.riskOn > 50 ? 'bg-emerald-900/50 text-emerald-400 border-emerald-500' : 'bg-slate-800 text-slate-600 border-slate-700'}`}>
-                                    On: {result.latestAllocation.riskOn}%
+                        {result.latestAllocation && (
+                            <div className="pt-6 border-t border-slate-800 space-y-4">
+                                <h4 className="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Current Signal</h4>
+                                <div className="flex gap-1 h-2.5 rounded-full overflow-hidden bg-slate-800">
+                                    <div className="bg-emerald-500 h-full" style={{ width: `${result.latestAllocation.riskOn}%` }}></div>
+                                    <div className="bg-slate-600 h-full" style={{ width: `${result.latestAllocation.riskOff}%` }}></div>
                                 </div>
-                                <div className={`flex-1 p-2 rounded text-center text-sm font-bold border ${result.latestAllocation.riskOff > 50 ? 'bg-slate-700 text-slate-200 border-slate-500' : 'bg-slate-800 text-slate-600 border-slate-700'}`}>
-                                    Off: {result.latestAllocation.riskOff}%
+                                <div className="flex justify-between text-[10px] font-mono uppercase font-bold">
+                                    <span className="text-emerald-400">On: {result.latestAllocation.riskOn.toFixed(0)}%</span>
+                                    <span className="text-slate-500">Off: {result.latestAllocation.riskOff.toFixed(0)}%</span>
                                 </div>
-                             </div>
-                        </div>
-                    )}
-                    
-                    <div className="pt-4 border-t border-slate-800 space-y-3">
-                        {saveTransactions && result.transactions.length > 0 && (
-                             <Button 
-                                variant="secondary" 
-                                className="w-full text-sm"
-                                onClick={downloadTransactionsCSV}
-                            >
-                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                                Download Trades (.CSV)
-                            </Button>
-                        )}
-
-                        <Button 
-                            variant="secondary" 
-                            className="w-full flex justify-between"
-                            onClick={handleAIAnalysis}
-                            disabled={isAnalyzing}
-                        >
-                            <span>Ask AI Analyst</span>
-                            {isAnalyzing ? <span className="animate-spin">...</span> : <span>✨</span>}
-                        </Button>
-                        {aiAnalysis && (
-                            <div className="mt-4 p-3 bg-indigo-900/20 border border-indigo-500/30 rounded-lg text-sm text-indigo-200 leading-relaxed">
-                                {aiAnalysis}
                             </div>
                         )}
-                    </div>
+                   </Card>
+                   <div className="lg:col-span-3 h-full">
+                       <Card className="p-0 overflow-hidden flex flex-col h-full min-h-[400px]">
+                           <div className="px-6 py-4 flex justify-between items-center bg-slate-900/50 border-b border-slate-800">
+                                <h3 className="text-xs font-bold text-slate-200 uppercase tracking-widest">Equity Curve</h3>
+                                <div className="flex gap-4">
+                                    <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-emerald-500"></span><span className="text-[9px] text-slate-400 uppercase font-bold">Strategy</span></div>
+                                    <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-slate-600"></span><span className="text-[9px] text-slate-400 uppercase font-bold">Benchmark</span></div>
+                                </div>
+                           </div>
+                           <div className="flex-1 w-full p-4">
+                               <ResponsiveContainer width="100%" height="100%">
+                                   <LineChart data={result.navSeries}>
+                                       <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                                       <XAxis dataKey="date" tick={{fontSize: 9}} minTickGap={50} stroke="#475569" />
+                                       <YAxis tick={{fontSize: 9}} stroke="#475569" domain={['auto', 'auto']} />
+                                       <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
+                                       <Line type="monotone" dataKey="value" stroke="#10b981" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                                       <Line type="monotone" dataKey="benchmarkValue" stroke="#475569" strokeWidth={1.5} dot={false} strokeDasharray="5 5" isAnimationActive={false} />
+                                   </LineChart>
+                               </ResponsiveContainer>
+                           </div>
+                       </Card>
+                   </div>
+               </div>
+
+               {/* Rolling Return Stats Table */}
+               <Card className="p-0 overflow-hidden">
+                   <div className="px-6 py-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center">
+                       <h3 className="text-xs font-bold text-slate-200 uppercase tracking-widest">Rolling Returns Analysis (CAGR)</h3>
+                       <span className="text-[9px] text-slate-500 font-mono">ANNUALIZED MIN / MEAN / MAX</span>
+                   </div>
+                   <table className="w-full text-xs text-left">
+                       <thead className="bg-slate-900/50 text-slate-500 uppercase font-bold tracking-widest border-b border-slate-800">
+                           <tr>
+                               <th className="px-6 py-4 font-bold">Tenor</th>
+                               <th className="px-6 py-4 font-bold text-emerald-400 border-l border-slate-800/50">Strategy (Min/Mean/Max)</th>
+                               <th className="px-6 py-4 font-bold border-l border-slate-800/50">Benchmark (Min/Mean/Max)</th>
+                           </tr>
+                       </thead>
+                       <tbody className="divide-y divide-slate-800/50">
+                           {rollingReturns.map(item => (
+                               <tr key={item.tenor} className="hover:bg-slate-900/30">
+                                   <td className="px-6 py-4 text-slate-400 font-bold">{item.tenor} Window</td>
+                                   <td className="px-6 py-4 border-l border-slate-800/50">
+                                       <div className="flex justify-between font-mono">
+                                           <span className="text-red-400/80">{item.strategy.min.toFixed(1)}%</span>
+                                           <span className="text-emerald-400 font-bold">{item.strategy.mean.toFixed(1)}%</span>
+                                           <span className="text-emerald-300/80">{item.strategy.max.toFixed(1)}%</span>
+                                       </div>
+                                   </td>
+                                   <td className="px-6 py-4 border-l border-slate-800/50">
+                                       <div className="flex justify-between font-mono text-slate-500">
+                                           <span className="text-red-900/80">{item.benchmark.min.toFixed(1)}%</span>
+                                           <span className="text-slate-200">{item.benchmark.mean.toFixed(1)}%</span>
+                                           <span className="text-slate-400/80">{item.benchmark.max.toFixed(1)}%</span>
+                                       </div>
+                                   </td>
+                               </tr>
+                           ))}
+                           {rollingReturns.length === 0 && (
+                               <tr><td colSpan={3} className="px-6 py-12 text-center text-slate-600 italic">Insufficient data for rolling analysis. Requires at least 3 months of data.</td></tr>
+                           )}
+                       </tbody>
+                   </table>
                </Card>
 
-               {/* Charts */}
-               <div className="lg:col-span-3 space-y-6">
-                   <Card className="h-96 relative">
-                       <div className="flex justify-between items-center mb-4">
-                           <h3 className="text-sm font-medium text-slate-400">Equity Curve vs {benchmarkLabel}</h3>
-                           <span className="text-xs bg-emerald-900/30 text-emerald-400 px-2 py-1 rounded border border-emerald-800">Real Market Data</span>
+               <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                   {/* CAGR Comparison Table */}
+                   <Card className="p-0 overflow-hidden">
+                       <div className="px-6 py-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center">
+                           <h3 className="text-xs font-bold text-slate-200 uppercase tracking-widest">CAGR Comparison (Tenors)</h3>
+                           <span className="text-[9px] text-slate-500 font-mono">ANNUALIZED RETURNS %</span>
                        </div>
-                       <ResponsiveContainer width="100%" height="90%">
-                           <LineChart data={result.navSeries}>
-                               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                               <XAxis dataKey="date" stroke="#64748b" tick={{fontSize: 12}} minTickGap={30} />
-                               <YAxis stroke="#64748b" tick={{fontSize: 12}} domain={['auto', 'auto']} />
-                               <Tooltip 
-                                    contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155' }}
-                                    itemStyle={{ color: '#cbd5e1' }}
-                                    formatter={(value: number) => [value.toFixed(2), '']}
-                               />
-                               <Legend verticalAlign="top" height={36} iconType="circle" />
-                               <Line type="monotone" dataKey="value" stroke="#10b981" strokeWidth={2} dot={false} name="Strategy NAV" />
-                               <Line type="monotone" dataKey="benchmarkValue" stroke="#64748b" strokeWidth={2} dot={false} name={benchmarkLabel} />
-                           </LineChart>
-                       </ResponsiveContainer>
+                       <table className="w-full text-xs text-left">
+                           <thead className="bg-slate-900/50 text-slate-500 uppercase font-bold tracking-widest border-b border-slate-800">
+                               <tr>
+                                   <th className="px-6 py-4 font-bold">Tenor</th>
+                                   <th className="px-6 py-4 font-bold text-emerald-400">Strategy</th>
+                                   <th className="px-6 py-4 font-bold">Benchmark</th>
+                               </tr>
+                           </thead>
+                           <tbody className="divide-y divide-slate-800/50">
+                               {tenorComparisons.map(t => (
+                                   <tr key={t.label} className="hover:bg-slate-900/30">
+                                       <td className="px-6 py-4 text-slate-400">{t.label} CAGR</td>
+                                       <td className="px-6 py-4 font-mono font-bold text-emerald-400">{t.strategy !== null ? `${t.strategy.toFixed(2)}%` : 'N/A'}</td>
+                                       <td className="px-6 py-4 font-mono text-slate-200">{t.benchmark !== null ? `${t.benchmark.toFixed(2)}%` : 'N/A'}</td>
+                                   </tr>
+                               ))}
+                           </tbody>
+                       </table>
                    </Card>
 
-                   <Card className="h-72">
-                       <h3 className="text-sm font-medium text-slate-400 mb-4">Total Asset Allocation (Stacked)</h3>
-                       <ResponsiveContainer width="100%" height="90%">
-                           <AreaChart data={result.navSeries}>
-                               <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                               <XAxis dataKey="date" hide />
-                               <YAxis domain={[0, 100]} stroke="#64748b" />
-                               <Tooltip 
-                                    contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155' }}
-                                    formatter={(value: number) => [`${value.toFixed(0)}%`, '']}
-                               />
-                               <Legend verticalAlign="top" height={36}/>
-                               <Area 
-                                    type="monotone" 
-                                    dataKey="riskOn" 
-                                    stackId="1" 
-                                    stroke="#059669" 
-                                    fill="#10b981" 
-                                    name="Risk On %" 
-                                    animationDuration={500}
-                               />
-                               <Area 
-                                    type="monotone" 
-                                    dataKey="riskOff" 
-                                    stackId="1" 
-                                    stroke="#475569" 
-                                    fill="#64748b" 
-                                    name="Risk Off %" 
-                                    animationDuration={500}
-                               />
-                           </AreaChart>
-                       </ResponsiveContainer>
+                   {/* Yearly Activity Table */}
+                   <Card className="p-0 overflow-hidden">
+                       <div className="px-6 py-4 bg-slate-900 border-b border-slate-800 flex justify-between items-center">
+                           <h3 className="text-xs font-bold text-slate-200 uppercase tracking-widest">Yearly Activity Analysis</h3>
+                           <div className="text-[10px] text-slate-500 font-mono font-bold uppercase">
+                               {yearlyStats.reduce((a, b) => a + b.switches, 0)} Switches • {yearlyStats.reduce((a, b) => a + (b.buys + b.sells), 0)} Trades
+                           </div>
+                       </div>
+                       <table className="w-full text-xs text-left">
+                           <thead className="bg-slate-900/50 text-slate-500 uppercase font-bold tracking-widest border-b border-slate-800">
+                               <tr>
+                                   <th className="px-6 py-4 font-bold">Year</th>
+                                   <th className="px-6 py-4 font-bold text-center">Switches</th>
+                                   <th className="px-6 py-4 font-bold text-center text-emerald-400">Buys</th>
+                                   <th className="px-6 py-4 font-bold text-center text-red-400">Sells</th>
+                                   <th className="px-6 py-4 font-bold text-right">Total</th>
+                               </tr>
+                           </thead>
+                           <tbody className="divide-y divide-slate-800/50">
+                               {yearlyStats.map(stat => (
+                                   <tr key={stat.year} className="hover:bg-slate-900/30">
+                                       <td className="px-6 py-4 font-bold text-slate-200">{stat.year}</td>
+                                       <td className="px-6 py-4 text-center font-mono text-slate-400">{stat.switches}</td>
+                                       <td className="px-6 py-4 text-center font-mono text-emerald-400">{stat.buys}</td>
+                                       <td className="px-6 py-4 text-center font-mono text-red-400">{stat.sells}</td>
+                                       <td className="px-6 py-4 text-right font-mono text-slate-200 font-bold">{stat.buys + stat.sells}</td>
+                                   </tr>
+                               ))}
+                               <tr className="bg-slate-900/60 font-bold border-t-2 border-slate-700">
+                                   <td className="px-6 py-4 text-white">TOTAL</td>
+                                   <td className="px-6 py-4 text-center font-mono text-white">{yearlyStats.reduce((a, b) => a + b.switches, 0)}</td>
+                                   <td className="px-6 py-4 text-center font-mono text-emerald-400">{yearlyStats.reduce((a, b) => a + b.buys, 0)}</td>
+                                   <td className="px-6 py-4 text-center font-mono text-red-400">{yearlyStats.reduce((a, b) => a + b.sells, 0)}</td>
+                                   <td className="px-6 py-4 text-right font-mono text-slate-200">{yearlyStats.reduce((a, b) => a + b.buys + b.sells, 0)}</td>
+                               </tr>
+                           </tbody>
+                       </table>
                    </Card>
                </div>
-           </div>
-       ) : (
-           <div className="flex flex-col items-center justify-center h-96 border-2 border-dashed border-slate-800 rounded-xl text-slate-500">
-               {isRunning ? (
-                   <div className="text-emerald-500 animate-pulse">Running Simulation...</div>
-               ) : (
-                   <>
-                    <svg className="w-16 h-16 mb-4 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                    <p>Select a strategy and click run to view results</p>
-                   </>
-               )}
+
+               <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                   {/* Risk Metrics Table */}
+                   <Card className="p-0 overflow-hidden">
+                       <div className="px-6 py-4 bg-slate-900 border-b border-slate-800">
+                           <h3 className="text-xs font-bold text-slate-200 uppercase tracking-widest">Risk Metrics Comparison</h3>
+                       </div>
+                       <table className="w-full text-xs text-left">
+                           <thead className="bg-slate-900/50 text-slate-500 uppercase font-bold tracking-widest border-b border-slate-800">
+                               <tr>
+                                   <th className="px-6 py-4 font-bold">Metrics</th>
+                                   <th className="px-6 py-4 font-bold text-emerald-400">Strategy</th>
+                                   <th className="px-6 py-4 font-bold">Benchmark</th>
+                               </tr>
+                           </thead>
+                           <tbody className="divide-y divide-slate-800/50">
+                               <tr><td className="px-6 py-4 text-slate-400">Ann. Volatility</td><td className="px-6 py-4 font-mono font-bold text-slate-200">{compStats.strategy.volatility}%</td><td className="px-6 py-4 font-mono">{compStats.benchmark.volatility}%</td></tr>
+                               <tr><td className="px-6 py-4 text-slate-400">Sharpe Ratio</td><td className="px-6 py-4 font-mono font-bold text-indigo-400">{compStats.strategy.sharpe}</td><td className="px-6 py-4 font-mono">{compStats.benchmark.sharpe}</td></tr>
+                               <tr><td className="px-6 py-4 text-slate-400">Max Drawdown</td><td className="px-6 py-4 font-mono font-bold text-red-400">-{compStats.strategy.maxDD}%</td><td className="px-6 py-4 font-mono text-red-500">-{compStats.benchmark.maxDD}%</td></tr>
+                           </tbody>
+                       </table>
+                   </Card>
+
+                   {/* Regime Exposure Area Chart */}
+                   <Card className="p-0 overflow-hidden">
+                        <div className="px-6 py-3 bg-slate-900 border-b border-slate-800 flex justify-between">
+                            <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Regime Exposure Over Time</h3>
+                            <div className="text-[9px] text-slate-600 font-mono">ON: GREEN | OFF: GREY</div>
+                        </div>
+                        <div className="h-48 w-full p-2">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <AreaChart data={result.navSeries}>
+                                    <Area type="monotone" dataKey="riskOn" stackId="1" stroke="#065f46" fill="#10b981" fillOpacity={0.6} isAnimationActive={false} />
+                                    <Area type="monotone" dataKey="riskOff" stackId="1" stroke="#334155" fill="#475569" fillOpacity={0.6} isAnimationActive={false} />
+                                    <XAxis dataKey="date" hide />
+                                    <YAxis hide domain={[0, 100]} />
+                                    <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '11px' }} />
+                                </AreaChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </Card>
+               </div>
            </div>
        )}
     </div>
