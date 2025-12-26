@@ -9,6 +9,8 @@ export interface SimTrade {
     value: number;
     shares: number;
     price: number;
+    riskOnPct?: number;
+    riskOffPct?: number;
 }
 
 export interface SimResultPoint {
@@ -249,7 +251,16 @@ export const StrategyEngine = {
                         holdings[t] -= qty;
                         cash += netCash;
                         nav -= cost;
-                        trades.push({ date, ticker: t, type: 'SELL', value: sellValRaw, shares: qty, price });
+                        trades.push({ 
+                            date, 
+                            ticker: t, 
+                            type: 'SELL', 
+                            value: sellValRaw, 
+                            shares: qty, 
+                            price,
+                            riskOnPct: Number((riskOnW * 100).toFixed(2)),
+                            riskOffPct: Number(((1 - riskOnW) * 100).toFixed(2))
+                        });
                     }
                 });
 
@@ -270,7 +281,16 @@ export const StrategyEngine = {
                             holdings[t] = (holdings[t] || 0) + qty;
                             cash -= (buyValDesired + cost);
                             nav -= cost;
-                            trades.push({ date, ticker: t, type: 'BUY', value: buyValDesired, shares: qty, price });
+                            trades.push({ 
+                                date, 
+                                ticker: t, 
+                                type: 'BUY', 
+                                value: buyValDesired, 
+                                shares: qty, 
+                                price,
+                                riskOnPct: Number((riskOnW * 100).toFixed(2)),
+                                riskOffPct: Number(((1 - riskOnW) * 100).toFixed(2))
+                            });
                         }
                     }
                 });

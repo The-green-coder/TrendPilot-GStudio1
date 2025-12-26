@@ -484,7 +484,16 @@ export const BacktestEngine = () => {
                        <div className="overflow-x-auto">
                            <table className="w-full text-left text-xs font-mono">
                                <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
-                                   <tr><th className="px-6 py-4">Date</th><th className="px-6 py-4">Ticker</th><th className="px-6 py-4 text-center">Action</th><th className="px-6 py-4 text-right">Shares</th><th className="px-6 py-4 text-right">Price</th><th className="px-6 py-4 text-right">Notional</th></tr>
+                                   <tr>
+                                       <th className="px-6 py-4">Date</th>
+                                       <th className="px-6 py-4">Ticker</th>
+                                       <th className="px-6 py-4 text-center">Action</th>
+                                       <th className="px-6 py-4 text-right text-emerald-400">Risk On %</th>
+                                       <th className="px-6 py-4 text-right text-slate-400">Risk Off %</th>
+                                       <th className="px-6 py-4 text-right">Shares</th>
+                                       <th className="px-6 py-4 text-right">Price</th>
+                                       <th className="px-6 py-4 text-right">Notional</th>
+                                   </tr>
                                </thead>
                                <tbody className="divide-y divide-slate-800">
                                    {detailedResult.trades
@@ -493,10 +502,26 @@ export const BacktestEngine = () => {
                                        <tr key={idx} className="hover:bg-slate-800/40 transition-colors group">
                                            <td className="px-6 py-4 text-slate-400">{t.date}</td>
                                            <td className="px-6 py-4 text-emerald-400 font-bold">{t.ticker}</td>
-                                           <td className="px-6 py-4 text-center"><span className={`px-2 py-0.5 rounded font-bold text-[10px] ${t.type === 'BUY' ? 'bg-emerald-900/30 text-emerald-500' : 'bg-red-900/30 text-red-500'}`}>{t.type}</span></td>
-                                           <td className="px-6 py-4 text-right text-slate-300">{t.shares.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
-                                           <td className="px-6 py-4 text-right text-slate-300">${t.price.toFixed(2)}</td>
-                                           <td className="px-6 py-4 text-right text-white font-bold">${t.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>
+                                           <td className="px-6 py-4 text-center">
+                                               <span className={`px-2 py-0.5 rounded font-bold text-[10px] ${t.type === 'BUY' ? 'bg-emerald-900/30 text-emerald-500' : 'bg-red-900/30 text-red-500'}`}>
+                                                   {t.type}
+                                               </span>
+                                           </td>
+                                           <td className="px-6 py-4 text-right text-emerald-500 font-bold">
+                                               {t.riskOnPct !== undefined ? `${t.riskOnPct}%` : '---'}
+                                           </td>
+                                           <td className="px-6 py-4 text-right text-slate-400 font-bold">
+                                               {t.riskOffPct !== undefined ? `${t.riskOffPct}%` : '---'}
+                                           </td>
+                                           <td className="px-6 py-4 text-right text-slate-300">
+                                               {t.shares.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                           </td>
+                                           <td className="px-6 py-4 text-right text-slate-300">
+                                               ${t.price.toFixed(2)}
+                                           </td>
+                                           <td className="px-6 py-4 text-right text-white font-bold">
+                                               ${t.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                                           </td>
                                        </tr>
                                    ))}
                                </tbody>
